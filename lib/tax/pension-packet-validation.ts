@@ -1,0 +1,318 @@
+import { prisma } from "@/lib/prisma";
+import { sumMoney } from "@/lib/money";
+import {
+  extractMappedSalaryGross,
+  extractMappedSalaryWithholding,
+  normalizeLedgerCategory,
+} from "./withholding-sources";
+import {
+  PENSION_SOURCE_VERSION,
+  resolveApprovedPensionSource,
+} from "./pension-source";
+import { resolveFinalPensionAdditionalNormalSurcharge } from "./non-business-computations-plan";
+import {
+  TY2026_PENSION_FORMER_EMPLOYER_SUBCATEGORY,
+  parsePersistedSelectionUserDetails,
+  resolvePensionFormerEmployerAnswer,
+} from "./rules/ty2026/subcategories";
+
+/** Read-only check immediately before dispatch/acceptance. Never repair a pinned packet. */
+export async function pensionPacketValidationError(
+  snapshot: any,
+  filingDraftId: string,
+  userId: string,
+  options: { allowManual?: boolean } = {},
+): Promise<string | null> {
+  const sources = snapshot?.filing?.incomeSources;
+  const includesPension = Array.isArray(sources) && sources.includes("pension");
+  if (!includesPension && !snapshot?.pension) return null;
+  if (
+    snapshot?.pension?.version !== PENSION_SOURCE_VERSION ||
+    !snapshot.pension.fingerprint
+  )
+    return "This pension packet predates reviewed annual sources. Recalculate, regenerate and approve a new pension packet; no portal entry is permitted.";
+  const [draft, profile, document, entries] = await Promise.all([
+    prisma.filingDraft.findFirst({
+      where: { id: filingDraftId, userId },
+      select: {
+        taxYear: true,
+        taxCalculationRevision: true,
+        incomeSources: true,
+        incomeSelections: {
+          where: { source: "pension", status: "SELECTED" },
+          select: {
+            source: true,
+            status: true,
+            subcategory: true,
+            detailsJson: true,
+          },
+        },
+      },
+    }),
+    prisma.user.findUnique({
+      where: { id: userId },
+      select: { dateOfBirth: true, cnic: true },
+    }),
+    prisma.document.findFirst({
+      where: { filingDraftId, userId, documentType: "pension_statement" },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      select: { id: true, extractionStatus: true, extractedData: true },
+    }),
+    prisma.ledgerEntry.findMany({
+      where: { filingDraftId, userId },
+      select: { category: true, entryType: true, amount: true },
+    }),
+  ]);
+  if (
+    !draft ||
+    draft.taxCalculationRevision !== snapshot.filing?.taxCalculationRevision
+  )
+    return "The pension calculation revision changed. Recalculate and approve a fresh packet before desktop entry.";
+  let liveSources: unknown;
+  try {
+    liveSources = JSON.parse(draft.incomeSources);
+  } catch {
+    return "Invalid current income selections. Recalculate the pension packet.";
+  }
+  if (!Array.isArray(liveSources) || !liveSources.includes("pension"))
+    return "Pension was removed from current income selections. Regenerate the packet before desktop entry.";
+  const selection = draft.incomeSelections.find(
+    (s) =>
+      s.source === "pension" &&
+      s.status === "SELECTED" &&
+      s.subcategory === TY2026_PENSION_FORMER_EMPLOYER_SUBCATEGORY,
+  );
+  const taxAsSalary = selection
+    ? resolvePensionFormerEmployerAnswer({
+        details:
+          parsePersistedSelectionUserDetails(selection.detailsJson) ??
+          undefined,
+      }) === "yes"
+    : false;
+  const category = normalizeLedgerCategory;
+  try {
+    const current = resolveApprovedPensionSource({
+      document,
+      taxYear: draft.taxYear,
+      profile: profile ?? {},
+      taxAsSalary,
+      ledgerPension: sumMoney(
+        entries
+          .filter(
+            (e) =>
+              e.entryType === "INCOME" && category(e.category) === "PENSION",
+          )
+          .map((e) => e.amount),
+      ),
+      ledgerTaxWithheld: sumMoney(
+        entries
+          .filter(
+            (e) =>
+              e.entryType === "EXPENSE" &&
+              category(e.category) === "TAX_PAYMENT",
+          )
+          .map((e) => e.amount),
+      ),
+      hasOtherIncomeSources: liveSources.some(
+        (source) => source !== "pension",
+      ),
+    });
+    if (current.fingerprint !== snapshot.pension.fingerprint)
+      return "Pension evidence, withholding, profile DOB/CNIC or former-employer answer changed. Recalculate and approve a new pension packet; the pinned packet cannot be reused.";
+    if (
+      Object.entries(current).some(
+        ([key, value]) => snapshot.pension[key] !== value,
+      )
+    )
+      return "Pension packet metadata does not match the current reviewed source. Regenerate the packet.";
+    const detailed = snapshot.portalFieldMapDetailed ?? snapshot.portalFieldMap;
+    if (
+      detailed?.computationHints?.pensionSourceFingerprint !==
+      current.fingerprint
+    )
+      return "Pension packet field map is not bound to its reviewed source. Regenerate the packet.";
+    const fields = Array.isArray(snapshot.portalFieldMap)
+      ? snapshot.portalFieldMap
+      : [
+          ...(Array.isArray(detailed?.incomeFields) ? detailed.incomeFields : []),
+          ...(Array.isArray(detailed?.adjustableTaxFields)
+            ? detailed.adjustableTaxFields
+            : []),
+        ];
+    const match = (irisCode: string, column: string, amount: number) => {
+      const rows = Array.isArray(fields)
+        ? fields.filter(
+            (f: any) =>
+              String(f.irisCode) === irisCode && f.column === column,
+          )
+        : [];
+      return (
+        rows.length === 1 &&
+        Number(rows[0].value ?? rows[0].ourAmount) === amount
+      );
+    };
+    const treatment = current.treatment;
+    if (detailed?.mappingGaps?.pensionManualReview && !options.allowManual)
+      return "Manual pension portal review required: the approved source has withholding without a verified IRIS placement for this treatment.";
+    if (treatment === "final_above_10m") {
+      const excess = Math.max(0, current.annualPension - 10_000_000);
+      const baseTax = Math.round(excess * 0.05);
+      const surcharge = Math.round(baseTax * 0.1);
+      const calcLines =
+        liveSources.includes("salary") &&
+        !liveSources.includes("business") &&
+        draft.taxCalculationRevision !== null &&
+        typeof prisma.filingTaxCalculationLine?.findMany === "function"
+          ? await prisma.filingTaxCalculationLine.findMany({
+              where: {
+                filingDraftId,
+                userId,
+                calculationRevision: draft.taxCalculationRevision,
+              },
+              select: { source: true, surcharge: true, detailsJson: true },
+            })
+          : [];
+      const hasUnmappedPortalIncome =
+        (detailed?.mappingGaps?.unmappedCategories?.length ?? 0) > 0;
+      // A filing that also carries mapped Services income types only the
+      // pension half of 923184: the salary-slab half of the Section 4AB
+      // surcharge is not proven for that combination, so `packet.ts` feeds the
+      // mapped Services total into this same resolver and stores no
+      // `normalSlabSurcharge` hint. Recompute with those identical inputs —
+      // read off the pinned field map, never re-guessed from the database — or
+      // this check demands a summed 923184 that the packet is designed to hold
+      // back (live job cmweo3f4x00is1e710btiaxn2: packet v6 was refused with
+      // "contract is incomplete" before the desktop could raise its own
+      // named-row pause).
+      const mappedServicesIncomePkr = sumMoney(
+        (Array.isArray(detailed?.businessFields)
+          ? detailed.businessFields
+          : []
+        )
+          .filter(
+            (field: any) =>
+              String(field?.column ?? "") === "Total Amount" &&
+              // Services rows only — a Business packet's own revenue rows also
+              // sit in `businessFields`, and those are priced by the business
+              // computations branch, never by this Services rule.
+              String(field?.servicesMappingKind ?? "").startsWith("SERVICES"),
+          )
+          .map((field: any) => Number(field?.ourAmount ?? field?.value ?? 0)),
+      );
+      const hasServicesIncomeGaps =
+        (snapshot?.coverage?.unmappedSources?.length ?? 0) > 0;
+      // Mapped 154A export revenue is final tax, so it does not block the
+      // salary-slab half. The packet writes that slice as a "Subject to Final
+      // Tax" cell on the same revenue row, so it can be read straight off the
+      // pinned field map without re-deriving the statutory section.
+      const mappedFinalTaxServicesIncomePkr = sumMoney(
+        (Array.isArray(detailed?.businessFields)
+          ? detailed.businessFields
+          : []
+        )
+          .filter(
+            (field: any) =>
+              String(field?.column ?? "") === "Subject to Final Tax" &&
+              String(field?.servicesMappingKind ?? "").startsWith("SERVICES"),
+          )
+          .map((field: any) => Number(field?.ourAmount ?? field?.value ?? 0)),
+      );
+      const expectedNormalSurcharge =
+        resolveFinalPensionAdditionalNormalSurcharge({
+          incomeSources: liveSources,
+          pensionTreatment: treatment,
+          calculationLines: calcLines,
+          mappedServicesIncomePkr,
+          mappedFinalTaxServicesIncomePkr,
+          hasServicesIncomeGaps,
+          hasUnmappedPortalIncome,
+          businessExpectedComputations:
+            snapshot?.business?.expectedIrisTotals?.computations ?? null,
+        });
+      const recordedNormalSurcharge =
+        detailed?.computationHints?.normalSlabSurcharge ?? 0;
+      const expectedTotalSurcharge = surcharge + expectedNormalSurcharge;
+      if (
+        current.baseTax !== baseTax ||
+        current.surcharge !== surcharge ||
+        current.taxDue !== baseTax + surcharge ||
+        recordedNormalSurcharge !== expectedNormalSurcharge ||
+        !match("1008", "Total Amount", current.annualPension) ||
+        !match("1008", "Subject to Final Tax", excess) ||
+        !match("1008", "Subject to Exemption", 10_000_000) ||
+        !match("64020007", "Taxable Amount", excess) ||
+        !match("64020007", "Tax Deducted", current.taxDeducted) ||
+        !match("923184", "Total Income", expectedTotalSurcharge)
+      )
+        return "Pension final-tax autofill contract is incomplete. Regenerate a reviewed packet with the PKR 10 million exemption, excess-only Final/64020007 base and Section 4AB surcharge.";
+      if (detailed?.mappingGaps?.pensionManualReview && !options.allowManual)
+        return "Pension final-tax packet still carries a stale manual-review gap. Regenerate the packet.";
+      return null;
+    }
+    const expectedExempt = treatment === "salary" ? 0 : current.annualPension;
+    if (
+      !match("1008", "Total Amount", current.annualPension) ||
+      !match("1008", "Subject to Exemption", expectedExempt) ||
+      !match("1008", "Subject to Final Tax", 0)
+    )
+      return "Pension Total/Exemption/Final zero-clear columns are incomplete. Regenerate the packet.";
+    if (treatment === "salary") {
+      const includesSalary = liveSources.includes("salary");
+      const salaryCert = includesSalary
+        ? await prisma.document.findFirst({
+            where: {
+              filingDraftId,
+              userId,
+              documentType: "salary_certificate",
+              extractionStatus: "MAPPED",
+            },
+            select: { extractedData: true },
+          })
+        : null;
+      const certGross = extractMappedSalaryGross(salaryCert?.extractedData ?? null);
+      const certWht =
+        certGross !== null && certGross > 0
+          ? (extractMappedSalaryWithholding(salaryCert?.extractedData ?? null) ?? 0)
+          : 0;
+      const expectedTotal149 = sumMoney([certWht, current.taxDeducted]);
+      const salaryBaseRows = Array.isArray(fields)
+        ? fields.filter(
+            (f: any) =>
+              String(f.irisCode) === "64020004" &&
+              f.column === "Taxable Amount",
+          )
+        : [];
+      const salaryBase =
+        salaryBaseRows.length === 1
+          ? Number(salaryBaseRows[0].value ?? salaryBaseRows[0].ourAmount)
+          : null;
+      const hasFinalRow =
+        Array.isArray(fields) &&
+        fields.some((f: any) => String(f.irisCode) === "64020007");
+      const salaryCreditOk =
+        current.taxDeducted > 0
+          ? match("64020004", "Tax Collected / Deducted", expectedTotal149) &&
+            salaryBase !== null &&
+            Number.isFinite(salaryBase) &&
+            salaryBase >= expectedTotal149 &&
+            !hasFinalRow
+          : certWht > 0
+            ? match("64020004", "Tax Collected / Deducted", certWht) &&
+              (salaryBase === null ||
+                (Number.isFinite(salaryBase) && salaryBase >= certWht)) &&
+              !hasFinalRow
+            : !hasFinalRow &&
+              !(
+                Array.isArray(fields) &&
+                fields.some((f: any) => String(f.irisCode) === "64020004")
+              );
+      if (!salaryCreditOk)
+        return "Pension worked as salary: the packet must carry the exact Section 149 credit on 64020004 (including any reviewed Salary Certificate withholding) and no final-tax row. Regenerate the approved packet.";
+    }
+  } catch (error) {
+    return error instanceof Error
+      ? error.message
+      : "Review and approve the latest pension statement before desktop entry.";
+  }
+  return null;
+}

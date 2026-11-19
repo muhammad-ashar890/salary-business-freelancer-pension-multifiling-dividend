@@ -1,0 +1,8 @@
+{
+  "lib/tax/capital-gains-fields.ts": "aadabddecc6d05005b3534c6c76111794f27c3748aa6f2fb2097338a1373d0e7",
+  "lib/tax/capital-gains-rates.ts": "287dbf51bf3373b15ac30b648f314bf1556f95a8b898a8d03c9247ee20cfdf14",
+  "lib/tax/capital-gains-derivation.ts": "0181dcf80d09d6716b1711a646129876ab7c6ced1ca4315d6c21dfb2e65de1c1",
+  "lib/tax/capital-gains-source.ts": "a9b03197fa437fd9a9c4d395650e03a819d499bb8d11d48ca9f59d276796e833",
+  "lib/tax/capital-gains-portal-rows.ts": "3c07fa1a5b742da8e362553c77dd3b515526491bc6255a38999f6e05ccdae347",
+  "lib/tax/capital-gains-route.ts": "7d2020e706a1bee044ac83b41e3b7a632ef703e2cba2146bc58009db8d8eeb3e"
+}

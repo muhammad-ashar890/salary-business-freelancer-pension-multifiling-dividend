@@ -1,0 +1,10 @@
+{
+  "app/actions/packet.ts": "eebe76788f92805fcdc2c1a59a3619074c66028444db85f4aeea91892e99fc83",
+  "lib/tax/tax-calculation.ts": "4c325dd2641e30c99ec691a250616ee9d25c90e87f8f50d4f1ae38b6bf166613",
+  "lib/tax/rules/ty2026/subcategories.ts": "0a136007cbbd6dd2d2f824ec65bcd4cf56c31eba4ba25a4d1ae584afd4de7169",
+  "lib/tax/bank-classification-rules.ts": "5947a0a419367bd9ef5f7ed4f4a99ec47922bd39ab063094925a7cc28aa2777b",
+  "lib/tax/document-review-required.ts": "aafca7ee765d16a9a51ee7365aad2742ad02043f0c787c190d793481341de470",
+  "prisma/schema.prisma": "6c6133fced02d8d3f03244bd859460e03b16efc362cb404b97c4759c029c4fcc",
+  "electron-connect/main.js": "3a7b999b5ac6d17e9258f70add4cc2726706100505af96daa04d645e58d5eb9b",
+  "electron-connect/package.json": "de5ae549df3c1a62230ed1ca99e237abd094e6e91c1ac0d3e8734e0225818862"
+}

@@ -1,0 +1,14 @@
+[
+  {
+    "path": "electron-connect/main.js",
+    "existed": true
+  },
+  {
+    "path": "electron-connect/iris-dividend-existing-income.js",
+    "existed": false
+  },
+  {
+    "path": "scripts/verify-dividend-existing-income.cjs",
+    "existed": false
+  }
+]

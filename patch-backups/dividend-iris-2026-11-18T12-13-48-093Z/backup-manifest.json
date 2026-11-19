@@ -1,0 +1,18 @@
+[
+  {
+    "path": "app/actions/packet.ts",
+    "existed": true
+  },
+  {
+    "path": "scripts/verify-bank-profit-packet-action.cjs",
+    "existed": true
+  },
+  {
+    "path": "scripts/verify-dividend-packet-action.cjs",
+    "existed": true
+  },
+  {
+    "path": "DIVIDEND_ENABLEMENT_NOTES.md",
+    "existed": false
+  }
+]

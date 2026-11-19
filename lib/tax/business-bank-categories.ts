@@ -1,0 +1,287 @@
+import { isFourIncomeSourceSet } from "./four-income-source-set";
+import type { MoneyInput } from "@/lib/money";
+
+export const BUSINESS_BANK_INCOME_CATEGORIES = ["BUSINESS_SALES", "BUSINESS_OTHER_RECEIPTS"] as const;
+export const BUSINESS_BANK_EXPENSE_CATEGORIES = ["BUSINESS_COST_OF_SALES", "BUSINESS_OPERATING_EXPENSE"] as const;
+export const BUSINESS_BANK_CATEGORIES = [...BUSINESS_BANK_INCOME_CATEGORIES, ...BUSINESS_BANK_EXPENSE_CATEGORIES] as const;
+export type BankDirection = "credit" | "debit" | "invalid";
+export type BankAmounts = { debit: MoneyInput; credit: MoneyInput };
+export type BankSuggestion = { status: string; entryType: string | null; category: string | null; confidence: number };
+/** Explicit capital/drawings evidence must outrank words such as "not business expense". */
+export function hasOwnerCapitalMovementDescription(value: unknown): boolean {
+  const text=String(value ?? '').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+  return /\b(?:owner|proprietor)(?:s| s)?\s+(?:draw(?:ing|ings)?|withdrawal|capital withdrawal|capital contribution|contribution)\b/.test(text)
+    || /\bdrawings?\s+(?:by|to|of)\s+(?:the\s+)?(?:owner|proprietor)\b/.test(text)
+    || /\b(?:personal withdrawal|capital introduced|not (?:a )?business expense|non business expense)\b/.test(text);
+}
+export const OWNER_CAPITAL_REVIEW_ERROR = "Owner drawings/capital movement cannot be approved as income, expenditure, an asset purchase or a loan from this description. Review the capital movement separately; do not assume personal spending, cash movement or an internal transfer. You may explicitly exclude it from this business ledger after reviewing the source; its capital/wealth treatment still needs review.";
+export function ownerCapitalReviewSuggestion(): BankSuggestion {
+  return {status:'UNREVIEWED',entryType:null,category:'OWNER_CAPITAL_REVIEW',confidence:0};
+}
+
+export const unreviewedBankSuggestion = (): BankSuggestion => ({ status: "UNREVIEWED", entryType: null, category: null, confidence: 0 });
+export const normalizeBankCategory = (value: unknown) => String(value ?? "").trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+export function isBusinessBankCategory(value: unknown) {
+  return (BUSINESS_BANK_CATEGORIES as readonly string[]).includes(normalizeBankCategory(value));
+}
+export function isMyselfBusinessBankFlow(input: { taxYear?: number; filerType?: string | null; incomeSources?: string | string[] | null }) {
+  if (input.taxYear !== 2026 || input.filerType !== "myself") return false;
+  try {
+    const sources = typeof input.incomeSources === "string" ? JSON.parse(input.incomeSources) : input.incomeSources;
+    return Array.isArray(sources) && sources.includes("business");
+  } catch { return false; }
+}
+
+function readIncomeSources(value: string | string[] | null | undefined): string[] {
+  try {
+    const sources = typeof value === "string" ? JSON.parse(value) : value;
+    return Array.isArray(sources)
+      ? (sources.every(source => typeof source === "string") ? sources : [])
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Freelancer / Services automation supports the seven existing source sets plus the exact four-income set:
+ * Services alone, Salary + Services, Pension + Services, Business + Services,
+ * Salary + Business + Services, Salary + Pension + Services, and Business +
+ * Pension + Services. All other combinations remain fail-closed.
+ * Compare sets rather than array order because the prerequisite screen does
+ * not promise a stable order for selected sources.
+ *
+ * The Business + Services set unlocks the gates only: Services rows and the
+ * Business payload still travel through separate code paths, so the packet
+ * builder and the desktop agent keep their own per-source checks.
+ */
+export function isSalaryBusinessServicesSourceSet(
+  incomeSources?: string | string[] | null,
+) {
+  const sources = readIncomeSources(incomeSources);
+  if (new Set(sources).size !== sources.length) return false;
+  const normalized = [...sources].sort();
+  return (
+    normalized.length === 3 &&
+    normalized[0] === "business" &&
+    normalized[1] === "salary" &&
+    normalized[2] === "services"
+  );
+}
+
+/**
+ * Salary + Pension + Services — the pension twin of the Salary + Business +
+ * Services triple: same Services envelope, with the reviewed pension source in
+ * place of the Business packet. Compared as a set because the setup screen does
+ * not promise a selection order.
+ */
+export function isSalaryPensionServicesSourceSet(
+  incomeSources?: string | string[] | null,
+) {
+  const sources = readIncomeSources(incomeSources);
+  if (new Set(sources).size !== sources.length) return false;
+  const normalized = [...sources].sort();
+  return (
+    normalized.length === 3 &&
+    normalized[0] === "pension" &&
+    normalized[1] === "salary" &&
+    normalized[2] === "services"
+  );
+}
+
+/**
+ * Business + Pension + Services — the Business triple without Salary. The
+ * Services envelope travels as usual; the Business packet keeps its slot and
+ * the reviewed pension source rides beside it, so this set needs its own
+ * versioned computations envelope (`business-pension-services-v1`) before the
+ * agent may activate — the gate alone never types anything.
+ */
+export function isBusinessPensionServicesSourceSet(
+  incomeSources?: string | string[] | null,
+) {
+  const sources = readIncomeSources(incomeSources);
+  if (new Set(sources).size !== sources.length) return false;
+  const normalized = [...sources].sort();
+  return (
+    normalized.length === 3 &&
+    normalized[0] === "business" &&
+    normalized[1] === "pension" &&
+    normalized[2] === "services"
+  );
+}
+
+export function isFreelancerIncomeSelected(input: {
+  incomeSources?: string | string[] | null;
+}) {
+  const sources = readIncomeSources(input.incomeSources);
+  if (new Set(sources).size !== sources.length) return false;
+  const normalized = [...sources].sort();
+  return (
+    (normalized.length === 1 && normalized[0] === "services") ||
+    (normalized.length === 2 &&
+      normalized[0] === "salary" &&
+      normalized[1] === "services") ||
+    (normalized.length === 2 &&
+      normalized[0] === "business" &&
+      normalized[1] === "services") ||
+    (normalized.length === 2 &&
+      normalized[0] === "pension" &&
+      normalized[1] === "services") ||
+    isSalaryBusinessServicesSourceSet(sources) ||
+    isSalaryPensionServicesSourceSet(sources) ||
+    isBusinessPensionServicesSourceSet(sources) ||
+    isFourIncomeSourceSet(sources)
+  );
+}
+
+/**
+ * A filing whose only income source is Pension. Pension packets never carry
+ * employer names (that list comes from a reviewed salary certificate), so
+ * callers use this to keep salary-route employer UI and messages off pension
+ * filings. Any combined-source filing keeps the existing behaviour, so this
+ * too must stay an exact single-source check.
+ */
+export function isPensionOnlyFiling(input: {
+  incomeSources?: string | string[] | null;
+}) {
+  const sources = readIncomeSources(input.incomeSources);
+  return sources.length === 1 && sources[0] === "pension";
+}
+
+export function isSalaryBusinessServicesFiling(input: {
+  taxYear?: number;
+  filerType?: string | null;
+  incomeSources?: string | string[] | null;
+}) {
+  return (
+    input.taxYear === 2026 &&
+    input.filerType === "myself" &&
+    isSalaryBusinessServicesSourceSet(input.incomeSources)
+  );
+}
+
+/**
+ * Full gate for Route 7 — Business + Pension + Services (no Salary), TY2026
+ * Myself. The set predicate alone only opens the door: the desktop resolver
+ * also needs the `business-pension-services-v1` envelope this gate does not
+ * produce, so a filing that passes here still types nothing by itself.
+ */
+export function isBusinessPensionServicesFiling(input: {
+  taxYear?: number;
+  filerType?: string | null;
+  incomeSources?: string | string[] | null;
+}) {
+  return (
+    input.taxYear === 2026 &&
+    input.filerType === "myself" &&
+    isBusinessPensionServicesSourceSet(input.incomeSources)
+  );
+}
+
+/** Setup/evidence eligibility only. Execution requires the versioned fourIncome contract. */
+export function isFourIncomeFiling(input: { taxYear?: number; filerType?: string | null; incomeSources?: string | string[] | null }) {
+  return input.taxYear === 2026 && input.filerType === "myself" && isFourIncomeSourceSet(readIncomeSources(input.incomeSources));
+}
+
+/** Full server-side gate for the supported TY2026 Myself Services routes. */
+export function isSingleFreelancerServicesFiling(input: {
+  taxYear?: number;
+  filerType?: string | null;
+  incomeSources?: string | string[] | null;
+}) {
+  return (
+    input.taxYear === 2026 &&
+    input.filerType === "myself" &&
+    isFreelancerIncomeSelected(input)
+  );
+}
+
+/** Keep the freelancer-services ledger category scoped to that exact route. */
+export function freelancerBankDecisionError(
+  entryType: string,
+  category: unknown,
+  freelancerEnabled: boolean,
+): string | null {
+  if (normalizeBankCategory(category) !== "SERVICES") return null;
+  if (!freelancerEnabled)
+    return "Freelancer services income is enabled only for TY2026 Myself filings with either Services alone, exactly Salary + Services, exactly Pension + Services, exactly Business + Services, exactly Salary + Business + Services, exactly Salary + Pension + Services, or exactly Business + Pension + Services; other combinations remain unsupported.";
+  if (entryType !== "INCOME")
+    return "Choose Income for freelancer services receipts.";
+  return null;
+}
+
+export function unselectedIncomeSourceBankError(
+  entryType: string | null | undefined,
+  category: unknown,
+  incomeSources?: string | string[] | null,
+): string | null {
+  const normalized = normalizeBankCategory(category);
+  if (normalized !== "SALARY" && normalized !== "PENSION") return null;
+  const sources = readIncomeSources(incomeSources);
+  if (sources.length === 0) return null;
+  if (normalized === "SALARY") {
+    if (!sources.includes("salary")) {
+      return "Salary income is not selected in Income sources for this filing. Select Salary in Setup (and upload the Salary Certificate) if you earned salary, or change/exclude this transaction.";
+    }
+    if (entryType !== "INCOME") {
+      return "Choose Income for salary receipts.";
+    }
+  }
+  if (normalized === "PENSION") {
+    if (!sources.includes("pension")) {
+      return "Pension income is not selected in Income sources for this filing. Select Pension in Setup (and upload the Pension Statement) if you received a pension, or change/exclude this transaction.";
+    }
+    if (entryType !== "INCOME") {
+      return "Choose Income for pension receipts.";
+    }
+  }
+  return null;
+}
+
+export function bankTransactionDirection(input: BankAmounts): BankDirection {
+  const debit = Number(input.debit ?? 0), credit = Number(input.credit ?? 0);
+  if (!Number.isFinite(debit) || !Number.isFinite(credit) || debit < 0 || credit < 0) return "invalid";
+  return credit > 0 && debit === 0 ? "credit" : debit > 0 && credit === 0 ? "debit" : "invalid";
+}
+export function bankEntryDirectionError(input: BankAmounts, entryType: string | null | undefined): string | null {
+  const direction = bankTransactionDirection(input);
+  const expected = entryType === "INCOME" || entryType === "LIABILITY" ? "credit" : entryType === "EXPENSE" || entryType === "ASSET" ? "debit" : null;
+  return expected && direction === expected ? null : "Choose a transaction type matching its debit/credit direction; a credit is not an expense and a debit is not income.";
+}
+export function businessBankDecisionError(entryType: string, category: unknown, businessEnabled: boolean): string | null {
+  if (!isBusinessBankCategory(category)) return null;
+  if (!businessEnabled) return "Business bank categories currently require Myself / Business Income / TY2026. Review the filing setup.";
+  const expected = (BUSINESS_BANK_INCOME_CATEGORIES as readonly string[]).includes(normalizeBankCategory(category)) ? "INCOME" : "EXPENSE";
+  return entryType === expected ? null : "Choose Income for business receipts, or Expense for business cost of sales/operating expenses.";
+}
+
+/** Validates an AI proposal, not an approval. Unknown categories stay manual. */
+export function applySafeBankAiSuggestion(
+  suggestion: { classification?: unknown; category?: unknown; confidence?: unknown } | undefined,
+  amounts: BankAmounts & { description?: string },
+  businessEnabled = false,
+  freelancerEnabled = false,
+): BankSuggestion {
+  if (businessEnabled && hasOwnerCapitalMovementDescription(amounts.description)) return ownerCapitalReviewSuggestion();
+  if (!suggestion || bankTransactionDirection(amounts) === "invalid") return unreviewedBankSuggestion();
+  const classification = String(suggestion.classification ?? "");
+  if (classification === "internal_transfer") return { status: "POTENTIAL_TRANSFER", entryType: null, category: "INTERNAL_TRANSFER", confidence: 0.5 };
+  if (classification === "cash_movement") return { status: "POTENTIAL_CASH_MOVEMENT", entryType: null, category: "CASH_MOVEMENT", confidence: 0.5 };
+  const typeByClass: Record<string, string> = { income: "INCOME", expense: "EXPENSE", asset: "ASSET", liability: "LIABILITY" };
+  const entryType = typeByClass[classification];
+  if (!entryType || bankEntryDirectionError(amounts, entryType)) return unreviewedBankSuggestion();
+  const category = normalizeBankCategory(suggestion.category);
+  const allowed: Record<string, readonly string[]> = {
+    INCOME: ["SALARY", "PENSION", "BANK_PROFIT", "PROPERTY_RENT", "DIVIDEND", "GIFT", "OTHER_INCOME", ...(freelancerEnabled ? ["SERVICES"] : []), ...(businessEnabled ? BUSINESS_BANK_INCOME_CATEGORIES : [])],
+    EXPENSE: ["PERSONAL_EXPENSE", "UTILITIES_OR_RENT", "TRANSPORT", "BANK_CHARGES", "TAX_PAYMENT", "OTHER_EXPENSE", ...(businessEnabled ? BUSINESS_BANK_EXPENSE_CATEGORIES : [])],
+    ASSET: ["PROPERTY", "VEHICLE", "EQUIPMENT", "INVESTMENT", "OTHER_ASSET", "ASSET_PURCHASE"],
+    LIABILITY: ["LOAN_PROCEEDS", "CREDIT_CARD", "OTHER_LIABILITY"],
+  };
+  if (
+    !allowed[entryType].includes(category) ||
+    businessBankDecisionError(entryType, category, businessEnabled) ||
+    freelancerBankDecisionError(entryType, category, freelancerEnabled)
+  ) return unreviewedBankSuggestion();
+  const rawConfidence = typeof suggestion.confidence === "number" && Number.isFinite(suggestion.confidence) ? suggestion.confidence : 0.5;
+  return { status: entryType === "EXPENSE" ? "SUGGESTED" : `POTENTIAL_${entryType}`, entryType, category, confidence: Math.max(0, Math.min(1, rawConfidence)) };
+}

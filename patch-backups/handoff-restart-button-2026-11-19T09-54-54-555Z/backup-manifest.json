@@ -1,0 +1,10 @@
+[
+  {
+    "path": "components/tax/fbr-connect-client.tsx",
+    "existed": true
+  },
+  {
+    "path": "scripts/verify-fbr-review-message.cjs",
+    "existed": true
+  }
+]

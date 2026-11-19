@@ -1,0 +1,18 @@
+[
+  {
+    "path": "components/tax/fbr-connect-client.tsx",
+    "existed": true
+  },
+  {
+    "path": "components/tax/wizard-ui.tsx",
+    "existed": true
+  },
+  {
+    "path": "lib/tax/fbr-review-message.ts",
+    "existed": false
+  },
+  {
+    "path": "scripts/verify-fbr-review-message.cjs",
+    "existed": false
+  }
+]

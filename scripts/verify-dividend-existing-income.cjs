@@ -1,0 +1,14 @@
+const {test}=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs');
+const {checkExistingDividendIncome:check,VIEW}=require('../electron-connect/iris-dividend-existing-income');
+const route={active:true,agentFields:[{irisCode:'64030055',values:[{columnIndex:0,value:'100000'},{columnIndex:1,value:'15000'}]}]};
+const row=(code,gross,tax,description='income')=>({code,description,cells:[{value:gross},{value:tax}]});
+const census=rows=>({complete:true,views:[{key:VIEW,ok:true,rows}]});
+test('empty income surface is allowed',()=>assert.equal(check(census([]),route).ok,true));
+test('matching existing dividend allows idempotent resume',()=>assert.equal(check(census([row('64030055','100,000','15,000')]),route).ok,true));
+test('UBL parent/detail detected once without summing twice',()=>{const c=check(census([row('64040052','2,465','494','UBL'),row('64040052','2,465','494','UBL --')]),route);assert.equal(c.ok,false);assert.equal(c.conflicts.length,1);assert.equal(c.conflicts[0].gross,2465);assert.equal(c.conflicts[0].tax,494);});
+test('different existing dividend blocks overwrite',()=>assert.equal(check(census([row('64030055','50','7')]),route).ok,false));
+test('unplanned withholding without gross blocks',()=>assert.equal(check(census([row('64040052','','494')]),route).ok,false));
+for(const [name,c]of [['missing',null],['incomplete',{...census([]),complete:false}],['unknown amount',census([row('64040052','?','4')])],['duplicate details',census([row('64040052','1','1','x --'),row('64040052','1','1','y --')])]])test(name,()=>assert.equal(check(c,route).ok,false));
+test('headers ignored',()=>assert.equal(check(census([row('999919','100','50')]),route).ok,true));
+test('real captured UBL preflight refuses before entry',()=>{const f='/home/user/uploads/latest-census.json';if(!fs.existsSync(f))return;const r=check(JSON.parse(fs.readFileSync(f)).start,route);assert.equal(r.ok,false);assert.equal(r.conflicts[0].gross,2465);});
+test('main guard precedes setup/write paths and returns on conflict',()=>{const s=fs.readFileSync('electron-connect/main.js','utf8');const a=s.indexOf('// Read-only Dividend preflight BEFORE');assert.ok(a>0);assert.ok(a<s.indexOf('// Before ANY autofill:',a));const b=s.slice(a,s.indexOf('// Before ANY autofill:',a));assert.ok(b.includes('if (!existingIncomeCheck.ok)'));assert.ok(b.includes('return {paused:true'));assert.equal(b.includes('fillDividendEntries'),false);});
