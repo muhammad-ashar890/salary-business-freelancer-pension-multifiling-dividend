@@ -52,6 +52,7 @@
       "iris-tax-deduction-driver.js",
       "iris-dividend-entry.js",
       "iris-bank-profit-entry.js",
+      "iris-bank-profit-existing-income.js",
       "iris-other-sources-wealth.js",
       "iris-bank-profit-row-driver.js",
       "iris-computations-driver.js",

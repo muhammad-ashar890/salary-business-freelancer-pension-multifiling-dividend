@@ -318,7 +318,7 @@ function handoffReviewCtx(visited, fillStatus = "filled", extras = {}) {
 }
 
 
-function mainHarness({bankOk=true,postSaveDrift=false,wealthGap=false,saveThrows=false,saveNotClicked=false,dialogOpen=false,identityBeforeSave=false,cancelBeforeSave=false,previousOpening=null,previousActual="1500000",previousAfterSave=null}={}){
+function mainHarness({bankOk=true,postSaveDrift=false,wealthGap=false,saveThrows=false,saveNotClicked=false,dialogOpen=false,identityBeforeSave=false,cancelBeforeSave=false,previousOpening=null,previousActual="1500000",previousAfterSave=null,existingOtherSourcesRows=null}={}){
  const visited=[];let saves=0,bankReads=0;const s=snapshot();
  if(previousOpening!==null)s.wealthExpectations={previousYearNetAssets:{irisCode:"703002",expected:previousOpening,previousReturnTaxYear:2025,source:"approved_previous_return_703001"}};
  const wealth={irisCode:"7098",value:"150000",sourceGroup:"wealthFields",rowDescriptionIncludes:"Income tax deducted u/s 151",label:"Income tax deducted u/s151"};
@@ -328,10 +328,23 @@ function mainHarness({bankOk=true,postSaveDrift=false,wealthGap=false,saveThrows
  const tour={complete:true,views:[{key:"116 - Wealth Statement > Reconciliation of Net Assets",rows:[{code:"7033",cells:[{value:"1000000"}]},{code:"703000",cells:[{value:wealthGap?"1":"0"}]}]}],totals:{7033:"1000000",703000:wealthGap?"1":"0"}};
  if(previousOpening!==null&&previousActual!==null)tour.views[0].rows.push({code:"703002",cells:[{value:previousActual}]});
  const ctx=handoffReviewCtx(visited,"filled",{
+  // The new read-only Bank Profit preflight dependency (same role as
+  // irisDividendExistingIncome for the Dividend route).
+  irisBankProfitExistingIncome:require("../electron-connect/iris-bank-profit-existing-income"),
   irisBankProfitEntry:{...entry,fillBankProfitEntries:async(_w,route,options)=>{visited.push("bank_fill");await options.beforeStep();assert.equal((await options.verifyDocument()).ok,true);return{ok:bankOk,reason:bankOk?null:"held",results:bankResults};},readBankProfitEntries:async()=>{bankReads++;const checks=rows.flatMap(row=>row.values.map(cell=>({key:`bank_profit:${row.documentId}:${row.irisCode}:${cell.columnIndex}`,irisCode:row.irisCode,documentId:row.documentId,columnIndex:cell.columnIndex,status:postSaveDrift&&saves>0?"mismatch":"match",expected:cell.value,afterTabValue:cell.value})));return{complete:!(postSaveDrift&&saves>0),checks};}},
   irisNavigation:{...navigation,navigateToSection:async(_w,{sectionId})=>{visited.push(sectionId);return{ok:true};},probeFrames:async()=>({frames:[{document:{present:true,taxYear:2026,originalFullYear:true,identityStatus:identityBeforeSave&&bankReads>0?"mismatch":"match"}}]})},
   buildFbrHandoffRoute:require("../electron-connect/fbr-handoff-route").buildFbrHandoffRoute,
-  irisTourCensus:{...census,runCensusTour:async(_w,options)=>{assert.ok(options.onlyViews.every(view=>view.startsWith("116 - Wealth Statement")));visited.push(options.label);if(saves>0&&previousAfterSave!==null){const copy=JSON.parse(JSON.stringify(tour));copy.views[0].rows.find(row=>row.code==="703002").cells[0].value=previousAfterSave;return copy;}return tour;},collectTotals:t=>t?.totals||{},compareTypedEntries:(_t,entries)=>entries.filter(row=>row.sourceGroup!=="bankProfitFields").map(row=>({key:row.key||`${row.irisCode}|${row.rowDescriptionIncludes||""}`,irisCode:row.irisCode,status:"match"})),saveCensusReport:()=>null},
+  irisTourCensus:{...census,runCensusTour:async(_w,options)=>{
+   // The Bank Profit existing-income preflight reads the Other Sources grid
+   // BEFORE anything is typed; the Wealth checks still only read 116.
+   const otherSources=options.onlyViews.every(view=>view==="Other Sources > Tax Deductions");
+   assert.ok(otherSources||options.onlyViews.every(view=>view.startsWith("116 - Wealth Statement")));
+   visited.push(options.label);
+   if(otherSources){
+     // Empty grid by default: nothing is already saved, so the packet matches.
+     return {complete:true,views:[{key:"Other Sources > Tax Deductions",ok:true,dialogsOpen:false,rows:existingOtherSourcesRows||[]}]};
+   }
+   if(saves>0&&previousAfterSave!==null){const copy=JSON.parse(JSON.stringify(tour));copy.views[0].rows.find(row=>row.code==="703002").cells[0].value=previousAfterSave;return copy;}return tour;},collectTotals:t=>t?.totals||{},compareTypedEntries:(_t,entries)=>entries.filter(row=>row.sourceGroup!=="bankProfitFields").map(row=>({key:row.key||`${row.irisCode}|${row.rowDescriptionIncludes||""}`,irisCode:row.irisCode,status:"match"})),saveCensusReport:()=>null},
   irisSaveDraft:{saveReturnDraft:async()=>{saves++;visited.push("save");if(saveThrows)throw new Error("synthetic_save_failure");return{clicked:!saveNotClicked,status:saveNotClicked?"not_clicked":"saved_confirmed",...(dialogOpen?{dialog:{closed:false}}:{})};},describeSaveOutcome:()=>"saved"},
   getCensusTourEnabled:()=>false,getWealthAutofillEnabled:()=>true,ensureNavigationJobActive:async()=>{if(cancelBeforeSave&&bankReads>0)throw new Error("synthetic_job_cancelled");},
   irisWealthDriver:{runWealthDriverStepwise:async(_w,fields)=>({results:fields.map(row=>({...row,status:"filled"})),setup:[],stopped:false})},

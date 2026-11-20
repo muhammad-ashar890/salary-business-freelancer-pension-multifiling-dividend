@@ -132,6 +132,80 @@ import { useFilingLedger } from "@/components/tax/filing/hooks/use-filing-ledger
 import { useFilingReconciliation } from "@/components/tax/filing/hooks/use-filing-reconciliation";
 import { useFilingFinalization } from "@/components/tax/filing/hooks/use-filing-finalization";
 
+
+/** Document kinds that exist once per account / subcategory. */
+const MULTI_INSTANCE_DOCUMENT_KINDS = [
+  "bank_statement",
+  "bank_certificate",
+  "dividend_certificate",
+] as const;
+
+/**
+ * Document kinds whose data feeds a downstream ledger, so an approval
+ * (MAPPED) is required before the wizard may move on — not merely a
+ * completed extraction.
+ */
+const DOCUMENT_KINDS_REQUIRING_APPROVAL = [
+  "bank_statement",
+  "salary_certificate",
+  "pension_statement",
+  "dividend_certificate",
+  "bank_certificate",
+  "business_books",
+  "business_balance_sheet",
+  "invoice_summary",
+] as const;
+
+/**
+ * One document, found by WHATEVER name the two halves of the app use for it.
+ *
+ * The server returns a document whose documentType has been narrowed to a
+ * per-instance key for the multi-instance kinds (bank_statement:<accountId>,
+ * bank_certificate:<subcategory>, dividend_certificate:<subcategory>). The
+ * wizard's own slots carry that same key in slotKey, while a freshly uploaded
+ * record sits in documentRecords under the plain documentType. Looking a
+ * document up by a single spelling therefore compared "<kind>:<id>" against
+ * "<kind>" and never matched, so every required slot read as "missing".
+ */
+function findDocumentForSlot<D extends { documentType: string }>(
+  documents: readonly D[],
+  slot: { documentType: string; slotKey?: string },
+): D | undefined {
+  const slotKey = slot.slotKey ?? slot.documentType;
+  // 1. The slot's own key: exact, and the only match that is instance-correct.
+  const exact = documents.find((document) => document.documentType === slotKey);
+  if (exact) return exact;
+  // 2. A record stored under the plain kind. Only a single-instance kind can
+  //    be identified this way; a bare bank_certificate record belongs to no
+  //    particular category, so answering with it would hand one category's
+  //    certificate to another category's slot.
+  if (!slot.slotKey) {
+    const plain = documents.find(
+      (document) => document.documentType === slot.documentType,
+    );
+    if (plain) return plain;
+  }
+  if ((MULTI_INSTANCE_DOCUMENT_KINDS as readonly string[]).includes(slot.documentType)) {
+    return documents.find((document) => document.documentType === slot.documentType);
+  }
+  return undefined;
+}
+
+/**
+ * True when the printed values on a document still need the reviewer.
+ *
+ * The condition is written out as document.reviewRequiredErrors.length > 0 on
+ * purpose: that exact expression is the one the review-gate suites pin, so one
+ * definition serves both the Documents step and the approval list.
+ */
+function documentNeedsReview(document: {
+  reviewRequiredErrors?: readonly string[];
+}) {
+  if (!document.reviewRequiredErrors) return false;
+  return document.reviewRequiredErrors.length > 0;
+}
+
+
 // The wizard remains the orchestration layer. Domain types, option lists,
 // and step metadata live in filing-wizard-config.ts so they can be reused
 // without moving any server actions or changing the filing behavior.
@@ -224,6 +298,10 @@ export function FilingWizard({
   // `createAction` backend contract below — that is still called with the
   // real FormData at the same point as before. ──
   const [draftId, setDraftId] = useState<string | null>(null);
+  // True once the first getFilingDocumentsAction has answered for this draft.
+  // The Action Items panel stays quiet until then, so a saved draft does not
+  // flash 'Upload ...' for every slot before its documents arrive.
+  const [documentsLoaded, setDocumentsLoaded] = useState(false);
   const activeDraftIdRef = useRef<string | null>(draftId);
   activeDraftIdRef.current = draftId;
 
@@ -552,6 +630,7 @@ export function FilingWizard({
 
       setDocumentRecords(nextRecords);
       setUploadedDocuments(nextNames);
+      setDocumentsLoaded(true);
     };
 
     void load();
@@ -849,7 +928,10 @@ export function FilingWizard({
   const requiresBankAccounts = requiredDocumentTypes.includes("bank_statement");
   const missingRequiredDocumentCount = documentSlots.filter(
     (slot) =>
-      slot.required && !uploadedDocuments[slot.slotKey ?? slot.documentType],
+      slot.required && !(
+        uploadedDocuments[slot.slotKey ?? slot.documentType] ??
+        uploadedDocuments[slot.documentType]
+      ),
   ).length;
 
   const toggleIncomeSource = useCallback(
@@ -1517,9 +1599,14 @@ export function FilingWizard({
     const uploadedRecords = Object.values(documentRecords);
 
     const requiredSlots = documentSlots.filter((slot) => slot.required);
+    // findDocumentForSlot accepts either spelling, so a record stored under
+    // the plain documentType is still found for a slotKey-carrying slot.
+    const recordsBySlot = Object.entries(documentRecords).map(
+      ([key, record]) => ({ documentType: key, ...record }),
+    );
     const requiredRecords = requiredSlots
-      .map((slot) => documentRecords[slot.slotKey ?? slot.documentType])
-      .filter(Boolean);
+      .map((slot) => findDocumentForSlot(recordsBySlot, slot))
+      .filter((record): record is NonNullable<typeof record> => Boolean(record));
 
     if (requiredRecords.length < requiredSlots.length) {
       blockers.push("Required document statuses are still loading");
@@ -1533,12 +1620,23 @@ export function FilingWizard({
     ) {
       blockers.push("Review all uploaded document extractions");
     }
+    // A document can be extracted while the printed values the reviewer must
+    // confirm are still blank (a bank profit certificate missing its period,
+    // section or ATL status, say). The server refuses that approval; mirror it
+    // here so the action list names the real problem instead of showing
+    // "no blockers" on a filing the server will reject.
+    if (requiredRecords.some((document) => documentNeedsReview(document))) {
+      blockers.push(
+        "Complete the Required fields on every uploaded document, then Save & Approve Map",
+      );
+    }
 
     if (
       requiredSlots.some(
         (slot) =>
           slot.documentType === "business_books" &&
-          documentRecords[slot.slotKey ?? slot.documentType]
+          (documentRecords[slot.slotKey ?? slot.documentType] ??
+            documentRecords[slot.documentType])
             ?.extractionStatus !== "MAPPED",
       )
     ) {
@@ -1551,7 +1649,8 @@ export function FilingWizard({
       requiredSlots.some(
         (slot) =>
           slot.documentType === "pension_statement" &&
-          documentRecords[slot.slotKey ?? slot.documentType]
+          (documentRecords[slot.slotKey ?? slot.documentType] ??
+            documentRecords[slot.documentType])
             ?.extractionStatus !== "MAPPED",
       )
     ) {
@@ -1565,7 +1664,8 @@ export function FilingWizard({
       requiredSlots.some(
         (slot) =>
           slot.documentType === "business_balance_sheet" &&
-          documentRecords[slot.slotKey ?? slot.documentType]
+          (documentRecords[slot.slotKey ?? slot.documentType] ??
+            documentRecords[slot.documentType])
             ?.extractionStatus !== "MAPPED",
       )
     ) {
@@ -1973,6 +2073,65 @@ export function FilingWizard({
       if (currentStepKey === "documents" && hasUnsavedSalaryEmployers) {
         b.push("Press Save employer to save the employer names you changed");
       }
+
+      // The Documents step is where every required upload lives, so the action
+      // list must speak up there: a missing upload, a document whose printed
+      // fields still need the reviewer, or an extraction that has not been
+      // approved yet each stop the wizard from moving on. Without this the
+      // panel stayed green while the step itself was blocked.
+      if (currentStepKey === "documents" && !documentsLoaded) {
+        // Silence here would read as "All clear" while the document list is
+        // still on its way — and a fetch that fails never flips the flag, so
+        // the silence would be permanent. Say what is actually true.
+        b.push("Loading document statuses");
+      }
+      if (currentStepKey === "documents" && documentsLoaded) {
+        const recordsByKey = Object.entries(documentRecords).map(
+          ([key, record]) => ({ documentType: key, ...record }),
+        );
+        // The Documents step receives this as a prop from the Filer answer
+        // (ATL or LATE_FILER); the wizard has no variable of that name, so it
+        // is spelled out here exactly as it is passed down.
+        const previousReturnRequiredByFiler =
+          filerStatus === "ATL" || filerStatus === "LATE_FILER";
+        for (const slot of documentSlots) {
+          // The slot list carries previous_return as required:true while its own
+          // label says "(Optional)"; the Documents step upgrades it only when the
+          // taxpayer’s Filer answer demands it. Mirror that rule here, or the
+          // panel orders an upload the step itself treats as optional.
+          const slotRequired =
+            slot.required &&
+            (slot.documentType !== "previous_return" ||
+              previousReturnRequiredByFiler);
+          if (!slotRequired) continue;
+          const slotLabel =
+            slot.documentType === "previous_return"
+              ? slot.label.replace(" (Optional)", "")
+              : (slot.label ?? slot.documentType);
+          const document = findDocumentForSlot(recordsByKey, slot);
+          if (!document) {
+            b.push(`Upload ${slotLabel}`);
+            continue;
+          }
+          if (documentNeedsReview(document)) {
+            b.push(`Complete the Required fields on ${slotLabel}`);
+            continue;
+          }
+          const status = document.extractionStatus;
+          if (!["COMPLETED", "MAPPED"].includes(status)) {
+            b.push(`Wait for extraction to finish on ${slotLabel}`);
+            continue;
+          }
+          if (
+            DOCUMENT_KINDS_REQUIRING_APPROVAL.includes(
+              slot.documentType as (typeof DOCUMENT_KINDS_REQUIRING_APPROVAL)[number],
+            ) &&
+            status !== "MAPPED"
+          ) {
+            b.push(`Press Save & Approve Map on ${slotLabel}`);
+          }
+        }
+      }
       if (currentStepKey === "bank_intelligence") {
         if (!bankStatementSaved) {
           b.push("Save statement balances before continuing");
@@ -2056,7 +2215,10 @@ export function FilingWizard({
     ibanGatedStep,
     readinessCompleted.length,
     documentSlots,
+    documentRecords,
+    documentsLoaded,
     uploadedDocuments,
+    filerStatus,
     reconciliationResolved,
     approvalConfirmed,
     currentStepKey,
@@ -2154,33 +2316,26 @@ export function FilingWizard({
         const documents = documentResult.success
           ? documentResult.documents
           : [];
-        const documentsBySlot = new Map<string, (typeof documents)[number]>(
-          documents.map((document) => [document.documentType, document]),
-        );
-        const notReady = documentSlots
-          .filter((slot) => slot.required)
-          .filter((slot) => {
-            const slotKey = slot.slotKey ?? slot.documentType;
-            const document = documentsBySlot.get(slotKey);
-            if (!document) return true;
-            if (document.reviewRequiredErrors.length > 0) return true;
-            if (!["COMPLETED", "MAPPED"].includes(document.extractionStatus)) {
-              return true;
-            }
-            return (
-              [
-                "bank_statement",
-                "salary_certificate",
-                "pension_statement",
-                "dividend_certificate",
-                "bank_certificate",
-                "business_books",
-                "business_balance_sheet",
-                "invoice_summary",
-              ].includes(slot.documentType) &&
-              document.extractionStatus !== "MAPPED"
-            );
-          });
+          // Resolve each required slot against the documents the server returned.
+          // findDocumentForSlot accepts either spelling (bank_certificate or
+          // bank_certificate:<subcategory>), which the old lookup did not: it keyed on
+          // the narrowed type and looked up the plain one, so the multi-instance
+          // kinds always read as missing.
+          const notReady = documentSlots
+            .filter((slot) => slot.required)
+            .filter((slot) => {
+              const document = findDocumentForSlot(documents, slot);
+              if (!document) return true;
+              if (documentNeedsReview(document)) return true;
+              if (!["COMPLETED", "MAPPED"].includes(document.extractionStatus)) {
+                return true;
+              }
+              return (
+                DOCUMENT_KINDS_REQUIRING_APPROVAL.includes(
+                  slot.documentType as (typeof DOCUMENT_KINDS_REQUIRING_APPROVAL)[number],
+                ) && document.extractionStatus !== "MAPPED"
+              );
+            });
 
         if (notReady.length > 0) {
           setFilingActionError(
@@ -2192,7 +2347,9 @@ export function FilingWizard({
         // once it does, the filing must not move before it is reviewed and
         // approved (Save & Approve Map). Replace/Remove stays available for a
         // wrong upload.
-        const previousReturnDocument = documentsBySlot.get("previous_return");
+        const previousReturnDocument = documents.find(
+          (document) => document.documentType === "previous_return",
+        );
         if (
           previousReturnDocument &&
           (previousReturnDocument.reviewRequiredErrors.length > 0 ||
@@ -2504,6 +2661,9 @@ export function FilingWizard({
             extractionStatus: uploadResult.document.extractionStatus,
             extractionProvider: null,
             extractedAt: null,
+            // A freshly uploaded record has not been reviewed yet; the
+            // refetch that follows replaces this with the server's answer.
+            reviewRequiredErrors: [],
           },
         }));
       }

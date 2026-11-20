@@ -64,6 +64,9 @@ function moduleLoader(mocks, bypassBankGateForTest = false) {
       console,
       URL,
       Date,
+      // process.env is read by lib/tax/bank-profit-enablement.ts; without it the
+      // switch looks unset and every enabled-mode assertion fails.
+      process,
       exports: module.exports,
       module,
       require: (child) => load(child, path.dirname(file)),
@@ -103,12 +106,12 @@ const fixtureValues = {
 const makeFields = (values = fixtureValues) =>
   Object.entries(values).map(([label, value]) => ({ label, value }));
 
-function packetHarness({mutateCertificate, stale = false, concurrentChange = false, combination = false, productionGate = false, ledgerRace = false, creditRace = false, identityRace = false, calculationRace = false, withholdingRace = false} = {}) {
+function packetHarness({mutateCertificate, stale = false, concurrentChange = false, combination = false, productionGate = false, ledgerRace = false, creditRace = false, identityRace = false, calculationRace = false, withholdingRace = false, taxYear = 2026, filerType = "myself"} = {}) {
  const documents=[{id:"bank-cert",documentType:"bank_certificate",bankProfitSubcategory:"bank-or-financial-institution-deposit",extractionStatus:"MAPPED",extractedData:JSON.stringify({fields:makeFields()})}];
  const evidenceInput={taxYear:2026,filerType:"myself",incomeSources:["bank_profit"],taxpayerCnic:"4210112345678",documents,selectedSubcategories:["bank-or-financial-institution-deposit"],ledgerEntries:[{entryType:"INCOME",category:"BANK_PROFIT",amount:850000}]};
  const fingerprint=moduleLoader({})("lib/tax/bank-profit-evidence.ts").buildBankProfitEvidence(evidenceInput).evidenceFingerprint;
  if(mutateCertificate)mutateCertificate(documents[0]);
- const draft={id:"draft",userId:"owner",taxYear:2026,filerType:"myself",residencyStatus:"resident",incomeSources:JSON.stringify(combination?["salary","bank_profit"]:["bank_profit"]),readinessChecks:"[]",taxCalculationStatus:"ESTIMATE",taxpayerListStatus:"ATL",taxRuleSetVersion:"fixture-ty2026",taxCalculationRevision:"revision",packetApprovalConfirmed:true,taxableIncome:new Prisma.Decimal(1000000),taxWithheld:new Prisma.Decimal(150000),taxPayable:new Prisma.Decimal(0),refundDue:new Prisma.Decimal(0),reconciliationStatus:"RECONCILED",reconciliationGap:new Prisma.Decimal(0)};
+ const draft={id:"draft",userId:"owner",taxYear,filerType,residencyStatus:"resident",incomeSources:JSON.stringify(combination?["salary","bank_profit"]:["bank_profit"]),readinessChecks:"[]",taxCalculationStatus:"ESTIMATE",taxpayerListStatus:"ATL",taxRuleSetVersion:"fixture-ty2026",taxCalculationRevision:"revision",packetApprovalConfirmed:true,taxableIncome:new Prisma.Decimal(1000000),taxWithheld:new Prisma.Decimal(150000),taxPayable:new Prisma.Decimal(0),refundDue:new Prisma.Decimal(0),reconciliationStatus:"RECONCILED",reconciliationGap:new Prisma.Decimal(0)};
  const ledger=[{id:"net-bank-credit",entryType:"INCOME",category:"BANK_PROFIT",description:"Net dividend",amount:new Prisma.Decimal(850000),entryDate:null,sourceTransactionId:null}];
  const selections=[{source:"bank_profit",subcategory:"bank-or-financial-institution-deposit",status:"SELECTED",detailsJson:"{}"}];
  const previousDocuments=[];const calls={created:[],queries:0};let inTransaction=false;
@@ -154,7 +157,29 @@ test("actual Bank Profit packet carries certificate gross, actual WHT, read-only
  assert.equal(snapshot.portalFieldMap.adjustableTaxFields.length,0);assert.equal(snapshot.portalFieldMap.incomeFields.some(row=>["7033","703000","500104"].includes(row.irisCode)),false);
 });
 for(const [name,config]of[["stale calculation",{stale:true}],["certificate edited",{mutateCertificate:doc=>doc.extractedData="{}"}],["unapproved certificate",{mutateCertificate:doc=>doc.extractionStatus="COMPLETED"}],["combination",{combination:true}],["transaction certificate edit",{concurrentChange:true}],["transaction net change",{ledgerRace:true}],["transaction duplicate tax credit",{creditRace:true}],["transaction taxpayer change",{identityRace:true}]])test(`actual Bank Profit packet rejects ${name} even with coverage override`,async()=>{const h=packetHarness(config);const r=await h.run({acceptUnmappedPortalSources:true});assert.equal(r.success,false);assert.equal(h.calls.created.length,0);});
-test("production Bank Profit packet gate remains closed with valid evidence and manual override",async()=>{const h=packetHarness({productionGate:true});const r=await h.run({acceptUnmappedPortalSources:true});assert.equal(r.success,false);assert.match(r.error,/Bank Profit packets remain blocked/);assert.equal(h.calls.created.length,0);});
+test("production Bank Profit packet gate stays closed by default with valid evidence and manual override",async()=>{const h=packetHarness({productionGate:true});const r=await h.run({acceptUnmappedPortalSources:true});assert.equal(r.success,false);assert.match(r.error,/Bank Profit packets remain blocked by default/);assert.equal(h.calls.created.length,0);});
+test("explicit enablement admits a real Bank Profit-only packet through the production gate",async()=>{
+ const previous=process.env.TAXROCKET_BANK_PROFIT_PACKET;process.env.TAXROCKET_BANK_PROFIT_PACKET="on";
+ try{
+  const h=packetHarness({productionGate:true});const r=await h.run({acceptUnmappedPortalSources:true});
+  assert.equal(r.success,true,r.error);assert.equal(h.calls.created.length,1);
+  const snapshot=JSON.parse(h.calls.created[0].snapshotJson);
+  assert.equal(snapshot.otherSources.bankProfit.version,"bank-profit-final-tax-v1");
+  assert.equal(require("../electron-connect/iris-bank-profit-entry").getBankProfitPacketRoute(snapshot).active,true);
+ } finally {
+  if(previous===undefined)delete process.env.TAXROCKET_BANK_PROFIT_PACKET;else process.env.TAXROCKET_BANK_PROFIT_PACKET=previous;
+ }
+});
+for(const [name,config]of[["a TY2025 draft",{taxYear:2025}],["a company filer",{filerType:"company"}]])test(`explicit enablement still refuses ${name}`,async()=>{
+ const previous=process.env.TAXROCKET_BANK_PROFIT_PACKET;process.env.TAXROCKET_BANK_PROFIT_PACKET="on";
+ try{const h=packetHarness({productionGate:true,...config});const r=await h.run({acceptUnmappedPortalSources:true});assert.equal(r.success,false);assert.equal(h.calls.created.length,0);}
+ finally{if(previous===undefined)delete process.env.TAXROCKET_BANK_PROFIT_PACKET;else process.env.TAXROCKET_BANK_PROFIT_PACKET=previous;}
+});
+test("the enablement switch never accepts a combination, even when set",async()=>{
+ const previous=process.env.TAXROCKET_BANK_PROFIT_PACKET;process.env.TAXROCKET_BANK_PROFIT_PACKET="on";
+ try{const h=packetHarness({productionGate:true,combination:true});const r=await h.run({acceptUnmappedPortalSources:true});assert.equal(r.success,false);assert.match(r.error,/Bank Profit-only/);assert.equal(h.calls.created.length,0);}
+ finally{if(previous===undefined)delete process.env.TAXROCKET_BANK_PROFIT_PACKET;else process.env.TAXROCKET_BANK_PROFIT_PACKET=previous;}
+});
 
 test("real server Bank Profit validator accepts current approved packet, including flattened context map",async()=>{
  const h=packetHarness();assert.equal((await h.run()).success,true);const snapshot=JSON.parse(h.calls.created[0].snapshotJson);assert.equal(await h.validate(snapshot),null);

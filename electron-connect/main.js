@@ -196,6 +196,7 @@ const irisTaxDeductionDriver = require("./iris-tax-deduction-driver");
 const irisDividendEntry = require("./iris-dividend-entry");
 const irisDividendExistingIncome = require("./iris-dividend-existing-income");
 const irisBankProfitEntry = require("./iris-bank-profit-entry");
+const irisBankProfitExistingIncome = require("./iris-bank-profit-existing-income");
 // Phase 3b (fix51): Computations rows 923184 (surcharge) / 9231822 (super tax).
 const irisComputationsDriver = require("./iris-computations-driver");
 // Phase 3c (fix52): the Section 113 "+ Turnover" row (used by the
@@ -4991,6 +4992,30 @@ async function runRealIrisAutofill(jobContext, job, mode) {
       const details = existingIncomeCheck.conflicts.map(row => `${row.description} [${row.code}]: gross ${row.gross.toLocaleString("en-US")}, tax deducted ${row.tax.toLocaleString("en-US")} — ${row.reason}.`).join(" ");
       const message = `${existingIncomeCheck.reason} ${details} No amounts were entered by this autofill run. Existing entries were not changed or deleted. Review the source records and align the supported filing before trying again; do not delete genuine income or add balancing amounts. Bank Profit + Dividend is not enabled by this check.`;
       return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage:message,executionLog,result:{mode,summary:{total:0,filled:0,skipped:0,byStatus:{}},results:[],existingIncomeCheck,reviewRequired:true,message,submitted:false}};
+    }
+  }
+
+  // Read-only Bank Profit preflight BEFORE any setup, typing or Save. Same
+  // contract as Dividend: the packet cannot see Other Sources rows already
+  // saved in IRIS, so a mismatch pauses and changes nothing.
+  if (bankProfitRoute?.active) {
+    let bankExistingCheck;
+    try {
+      const before = await irisTourCensus.runCensusTour(windowInstance, {
+        label: "bank profit existing income (before any entry)",
+        onlyViews: [irisBankProfitExistingIncome.VIEW],
+        onStep,
+        beforeStep: () => ensureNavigationJobActive(job.id, String(taxpayerIdentifier).trim().replace(/[ -]/g, "")),
+      });
+      bankExistingCheck = irisBankProfitExistingIncome.checkExistingBankProfitIncome(before, bankProfitRoute);
+    } catch (error) {
+      bankExistingCheck = {ok:false,reason:"Existing IRIS income could not be checked safely. No values will be entered.",conflicts:[]};
+    }
+    onStep("bank_profit_existing_income_check", bankExistingCheck.reason);
+    if (!bankExistingCheck.ok) {
+      const details = bankExistingCheck.conflicts.map(row => `${row.description} [${row.code}]: gross ${Number(row.gross).toLocaleString("en-US")}, tax deducted ${Number(row.tax).toLocaleString("en-US")} — ${row.reason}.`).join(" ");
+      const message = `${bankExistingCheck.reason} ${details} No amounts were entered by this autofill run. Existing entries were not changed or deleted. Review the source records and align the supported filing before trying again; do not delete genuine income or add balancing amounts. Dividend + Bank Profit combined entry is not enabled by this check.`;
+      return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage:message,executionLog,result:{mode,summary:{total:0,filled:0,skipped:0,byStatus:{}},results:[],bankExistingCheck,reviewRequired:true,message,submitted:false}};
     }
   }
 

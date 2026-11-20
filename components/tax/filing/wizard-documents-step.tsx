@@ -95,6 +95,8 @@ export type FilingDocumentRecord = {
   extractionStartedAt?: string | null;
   extractionError?: string | null;
   extractedAt: string | null;
+  /** Required-field errors still waiting on the reviewer (server-computed). */
+  reviewRequiredErrors?: string[];
 };
 
 export type WizardDocumentSlot = {

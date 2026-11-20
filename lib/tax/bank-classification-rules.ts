@@ -326,6 +326,207 @@ export function isRefundOrReversalDescription(description: string) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Bank profit credited by a bank
+// ---------------------------------------------------------------------------
+//
+// Every Pakistani bank words the same credit differently, and the instrument
+// can sit before or after the return word:
+//
+//   PROFIT ON TDR/PLS SAVINGS A/C CR          HBL
+//   PROFIT CREDIT ON DEPOSIT                  Standard Chartered
+//   SUKUK PROFIT DISTRIBUTION CR              Meezan (Islamic investment)
+//   PROFIT ON PLS ACCOUNT CR                  Meezan
+//   MONTHLY PROFIT CREDITED                   monthly savings products
+//   INTEREST CREDITED / INTEREST ON DEPOSIT   conventional banking
+//   PROFIT, WHT DEDUCTION, ZAKAT              the three entries read side by side
+//
+// An exhaustive phrase list cannot keep up with that. Every new bank adds a
+// wording the list does not carry, and the row falls through to the generic
+// "Potential income" question: "profit on tdr" and "profit credit" each had to
+// be patched in by hand, and "SUKUK PROFIT DISTRIBUTION CR" still went
+// unrecognised after both.
+//
+// So the rule reads the narration instead of matching phrases: a credit is
+// bank profit when a word for the return meets a word for the account it was
+// paid on, in either order, with any bank-specific words between them.
+const BANK_PROFIT_RETURN_WORDS = [
+  "profit",
+  "profits",
+  "interest",
+  "markup",
+  "mark up",
+] as const;
+
+// "Yield", "return" and "distribution" describe a bank return only beside the
+// instrument itself ("sukuk distribution"). Alone they are also capital-gains,
+// cheque, mutual-fund and dividend wording, none of which is bank profit.
+const BANK_PROFIT_WEAK_RETURN_WORDS = [
+  "yield",
+  "return",
+  "distribution",
+] as const;
+
+// A word that names what the money sat in.
+const BANK_PROFIT_INSTRUMENT_WORDS = [
+  "deposit",
+  "deposits",
+  "savings",
+  "saving",
+  "pls",
+  "tdr",
+  "term deposit",
+  "fixed deposit",
+  "sukuk",
+  "sukuks",
+  "nsc",
+  "certificate",
+  "certificates",
+  "dsc",
+  "ssc",
+  "ric",
+  "behbood",
+] as const;
+
+// Words for the account that carry no instrument name. Together with profit or
+// interest they are enough; on their own they are not, which is why the weak
+// return words above never use them.
+const BANK_PROFIT_ACCOUNT_WORDS = [
+  "account",
+  "a c",
+  "ac",
+  "investment",
+] as const;
+
+// A bank's own ledger wording for "we put money in your account". This is what
+// makes a bare "PROFIT CREDIT" or "PROFIT PAID" readable when the narration
+// names no instrument at all.
+const BANK_PROFIT_CREDIT_CHANNEL_WORDS = [
+  "credit",
+  "credited",
+  "cr",
+  "receipt",
+  "received",
+  "payment",
+  "paid",
+  "earned",
+  "accrued",
+  "posted",
+  "income",
+  // "Bank profit net of withholding": the payer is named, so the instrument
+  // does not have to be. "profit from bank" is excluded by the other-payer
+  // guard below instead.
+  "bank",
+] as const;
+
+// Wording that points at somebody else as the payer. A narration that names a
+// counterparty is not the bank's own ledger line, so without a deposit word
+// there is nothing that makes it profit on an account.
+const BANK_PROFIT_OTHER_PAYER_WORDS = [
+  "from",
+  "by",
+  "customer",
+  "customers",
+  "client",
+  "clients",
+  "partner",
+  "partners",
+  "shareholder",
+  "shareholders",
+  "ltd",
+  "limited",
+  "pvt",
+  "private",
+  "company",
+  "traders",
+  "trader",
+  "enterprises",
+  "brother",
+  "sister",
+  "father",
+  "mother",
+  "friend",
+] as const;
+
+// The same words describe a facility the taxpayer OWES - where the profit is
+// the bank's and belongs in expense - and trade-finance deals whose return is
+// business income. A narration carrying any of these is left to the rules that
+// already know those heads.
+const BANK_PROFIT_NOT_DEPOSIT_WORDS = [
+  "loan",
+  "loans",
+  "financing",
+  "finance",
+  "lease",
+  "leased",
+  "credit card",
+  "murabaha",
+  "musharakah",
+  "murabaha profit",
+  "musharakah profit",
+  "running finance",
+  "demand finance",
+  "on finance",
+  "against finance",
+  "letter of credit",
+  "lc",
+  "ijarah",
+  "installment",
+  "instalment",
+  "bill discounting",
+  "qarz",
+  "qard",
+  "partnership",
+  "profit share",
+  "share of profit",
+  "share in profit",
+  "penalty",
+  "late payment",
+  "rate",
+] as const;
+
+/**
+ * True when the narration reads as profit or interest paid by a bank on an
+ * account the taxpayer holds.
+ *
+ * Takes the description already normalised by normalizeBankDescription, so
+ * "A/C" has become "a c" and punctuation is gone. Matching is on whole words
+ * for the same reason the keyword matcher is: "profit" must not match inside
+ * a longer word, and "lc" must not match inside a name.
+ */
+export function isBankProfitDescription(normalized: string) {
+  const padded = ` ${normalized} `;
+  const present = (word: string) => padded.includes(` ${word} `);
+  const any = (words: readonly string[]) => words.some(present);
+
+  if (any(BANK_PROFIT_NOT_DEPOSIT_WORDS)) return false;
+
+  const instrument = any(BANK_PROFIT_INSTRUMENT_WORDS);
+  const account = any(BANK_PROFIT_ACCOUNT_WORDS);
+  const returnWord = any(BANK_PROFIT_RETURN_WORDS);
+
+  // "Profit on deposit", "sukuk profit", "interest on savings": a return word
+  // beside the thing the money sat in. Word order does not matter, and neither
+  // does anything the bank puts between them.
+  if (instrument && (returnWord || any(BANK_PROFIT_WEAK_RETURN_WORDS)))
+    return true;
+
+  // "Profit credited to your account", "interest on account".
+  if (account && returnWord) return true;
+
+  // "PROFIT CREDIT", "PROFIT PAID", "ISLAMIC PROFIT CREDIT": the bank's own
+  // ledger wording with no instrument named, readable only while nobody else
+  // is named as the payer.
+  if (
+    returnWord &&
+    any(BANK_PROFIT_CREDIT_CHANNEL_WORDS) &&
+    !any(BANK_PROFIT_OTHER_PAYER_WORDS)
+  )
+    return true;
+
+  return false;
+}
+
 export const CLASSIFICATION_RULES = [
   {
     // Property tax (& rates) is a provincial levy, NOT federal income tax
@@ -345,20 +546,7 @@ export const CLASSIFICATION_RULES = [
     confidence: 0.9,
   },
   {
-    keywords: [
-      "bank profit",
-      "profit credited",
-      "profit payment",
-      "profit on savings deposit",
-      "profit on deposit",
-      "savings profit",
-      "savings account profit",
-      "interest credited",
-      "interest income",
-      "deposit profit",
-      "profit on debt",
-      "markup",
-    ],
+    keywords: [],
     entryType: "INCOME",
     category: "BANK_PROFIT",
     confidence: 0.88,
@@ -526,6 +714,25 @@ export function classifyDescription(
             : false)) &&
       candidate.keywords.some((keyword) => matchesKeyword(normalized, keyword)),
   );
+
+  // Profit credited by a bank is read, not matched. The keyword list above
+  // carries the nine classic wordings; this covers every other way a bank can
+  // say the same thing ("SUKUK PROFIT DISTRIBUTION CR", "PROFIT CREDIT ON
+  // DEPOSIT", "MONTHLY PROFIT CREDITED", "INTEREST ON DEPOSIT"). It sits where
+  // a matching rule would have, so every caller - the classify action, the
+  // completeness scan and the sweep - reaches the same answer.
+  if (
+    !rule &&
+    (!direction || direction === "credit") &&
+    isBankProfitDescription(normalized)
+  ) {
+    return {
+      status: "SUGGESTED",
+      entryType: "INCOME",
+      category: "BANK_PROFIT",
+      confidence: 0.88,
+    };
+  }
 
   if (!rule) {
     return {
