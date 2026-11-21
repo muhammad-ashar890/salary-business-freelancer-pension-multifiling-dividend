@@ -40,6 +40,8 @@ const PAGE_CFG = Object.freeze({
   panelSelector: "mat-expansion-panel",
   panelHeaderSelector: "mat-expansion-panel-header",
   addSectionSelector: "button.btn-section-add",
+  calculateSelector:
+    "app-nitr-wf-body .body.interface_21.active button.calbtn, .body.interface_21.active button.calbtn",
   dialogSelector: "mat-dialog-container",
   cardSelector: ".source-card",
   detailAddSelector:
@@ -59,6 +61,7 @@ const PAGE_OPS = Object.freeze([
   "investment_dialog_state",
   "investment_dialog_fill",
   "investment_dialog_click",
+  "calculate",
 ]);
 
 /** Runs inside the IRIS page. Keep this function self-contained for Electron. */
@@ -100,7 +103,7 @@ function bankProfitPageOp(step) {
   };
   const panels = () =>
     Array.from(document.querySelectorAll(CFG.panelSelector)).filter((panel) => {
-      const header = panel.querySelector(CFG.panelHeaderSelector);
+      const header = panel.querySelector(`:scope > ${CFG.panelHeaderSelector}`);
       const title = header?.querySelector("mat-panel-title") || header;
       return visible(panel) && title && norm(title.textContent) === norm(CFG.gridTitle);
     });
@@ -179,7 +182,10 @@ function bankProfitPageOp(step) {
         ),
         description: rawLabel,
         labelMatched: detail
-          ? norm(rawLabel).startsWith(`${norm(CFG.label)} -`)
+          ? norm(rawLabel).startsWith(`${norm(CFG.label)} -`) ||
+            norm(rawLabel).startsWith(`${norm(CFG.label)}--`) ||
+            norm(rawLabel).startsWith(`${norm(CFG.label)}-`) ||
+            norm(rawLabel) === norm(CFG.label)
           : norm(rawLabel) === norm(CFG.label),
         cells: cellInputs.map((input) => ({
           disabled: Boolean(input.disabled),
@@ -207,14 +213,25 @@ function bankProfitPageOp(step) {
             candidate.id === code &&
             candidate.classList.contains("section-detail-child-row"),
         );
-        const detailDescription = detailRows[0]?.querySelector(".row-description-text");
-        const detailInputs = detailRows[0]
-          ? Array.from(
-              detailRows[0].querySelectorAll(
+        const allDetailsValid =
+          detailRows.length >= 1 &&
+          detailRows.every((detailRow) => {
+            const detailDescription = detailRow.querySelector(".row-description-text");
+            const detailInputs = Array.from(
+              detailRow.querySelectorAll(
                 ".columns-parent .data-middle-child-wapper input:not([type=\"hidden\"])",
               ),
-            )
-          : [];
+            );
+            return Boolean(
+              detailDescription &&
+                (norm(detailDescription.textContent).startsWith(`${norm(expectedLabel)} -`) ||
+                  norm(detailDescription.textContent).startsWith(`${norm(expectedLabel)}--`) ||
+                  norm(detailDescription.textContent).startsWith(`${norm(expectedLabel)}-`) ||
+                  norm(detailDescription.textContent) === norm(expectedLabel)) &&
+                detailInputs.length === CFG.columns.length &&
+                detailInputs.slice(0, 2).every((input) => !input.disabled && !input.readOnly),
+            );
+          });
         const directSukuk =
           CFG.directCodes.includes(code) &&
           inputs.length === CFG.columns.length &&
@@ -228,11 +245,7 @@ function bankProfitPageOp(step) {
           (directSukuk ||
             (inputs.length === CFG.columns.length &&
               inputs.every((input) => input.disabled) &&
-              detailRows.length === 1 &&
-              detailDescription &&
-              norm(detailDescription.textContent).startsWith(`${norm(expectedLabel)} -`) &&
-              detailInputs.length === CFG.columns.length &&
-              detailInputs.every((input) => !input.disabled && !input.readOnly)))
+              allDetailsValid))
           ? expectedLabel
           : null;
       })
@@ -408,6 +421,22 @@ function bankProfitPageOp(step) {
     return { status: "clicked" };
   }
 
+  if (step.op === "calculate") {
+    if (!CFG.directCodes.includes(String(CFG.code)))
+      return { status: "unsupported_operation" };
+    if (dialogs().length) return { status: "dialog_already_open" };
+    const buttons = Array.from(document.querySelectorAll(CFG.calculateSelector)).filter(
+      (button) => visible(button) && norm(button.textContent) === "calculate",
+    );
+    if (buttons.length !== 1)
+      return {
+        status: buttons.length ? "calculate_button_ambiguous" : "calculate_button_missing",
+      };
+    if (disabled(buttons[0])) return { status: "calculate_button_disabled" };
+    buttons[0].click();
+    return { status: "clicked" };
+  }
+
   return { status: "unsupported_operation" };
 }
 
@@ -416,6 +445,8 @@ function assertAllowedStep(step, targetCode = step?.code || BANK_PROFIT_CODE) {
   if (!targetLabel)
     throw new Error("Blocked by Bank Profit row driver: unsupported profit category code.");
   if (!step || !PAGE_OPS.includes(step.op))
+    throw new Error("Blocked by Bank Profit row driver: unsupported operation.");
+  if (step.op === "calculate" && !SUKUK_CODES.includes(String(targetCode)))
     throw new Error("Blocked by Bank Profit row driver: unsupported operation.");
   if (step.code !== undefined && String(step.code) !== String(targetCode))
     throw new Error("Blocked by Bank Profit row driver: step code does not match its approved target.");
@@ -471,7 +502,7 @@ const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const sameLabels = (actual, expected) =>
   JSON.stringify(actual) === JSON.stringify(expected);
 
-function verifiedDetailRow(snapshot) {
+function verifiedParentWithDetails(snapshot) {
   if (
     !snapshot ||
     snapshot.status !== "ok" ||
@@ -484,20 +515,24 @@ function verifiedDetailRow(snapshot) {
   const summaries = rows.filter((row) => !row.detail);
   const details = rows.filter((row) => row.detail);
   return Boolean(
-    rows.length === 2 &&
-      rows[0].detail === false &&
-      rows[1].detail === true &&
-      summaries.length === 1 &&
-      details.length === 1 &&
+    summaries.length === 1 &&
+      details.length >= 1 &&
       summaries[0].codeMatched &&
-      details[0].codeMatched &&
       summaries[0].labelMatched &&
       summaries[0].cells.length === FINAL_TAX_COLUMNS.length &&
       summaries[0].cells.every((cell) => cell.disabled) &&
-      details[0].labelMatched &&
-      details[0].cells.length === FINAL_TAX_COLUMNS.length &&
-      details[0].cells.every((cell) => !cell.disabled && !cell.readOnly),
+      details.every(
+        (detail) =>
+          detail.codeMatched &&
+          detail.labelMatched &&
+          detail.cells.length === FINAL_TAX_COLUMNS.length &&
+          detail.cells.slice(0, 2).every((cell) => !cell.disabled && !cell.readOnly),
+      ),
   );
+}
+
+function verifiedDetailRow(snapshot) {
+  return verifiedParentWithDetails(snapshot) && (snapshot.rows || []).length === 2;
 }
 
 function verifiedParentOnlyRow(snapshot) {
@@ -551,6 +586,10 @@ async function ensureBankProfitFinalTaxRow(windowInstance, options = {}) {
     addIfMissing = true,
     investment = "",
     contents = "",
+    allowedDetailDescriptions = null,
+    allowedFbrPrepopulatedRows = null,
+    expectedValues = null,
+    expectedChargeable = null,
     beforeStep = async () => {},
     onStep = () => {},
     sleep = defaultSleep,
@@ -563,8 +602,95 @@ async function ensureBankProfitFinalTaxRow(windowInstance, options = {}) {
   const readOnly = mode !== "live" || !addIfMissing;
   if (mode === "live" && typeof options.beforeStep !== "function") return {ok:false,status:"identity_guard_required",setup:[]};
   const normalizeApproved = value => String(value ?? "").replace(/\s+/g," ").trim();
+  const digits = value => String(value ?? "").trim().replace(/,/g, "");
   const approvedDescription = normalizeApproved(`${target.label} - ${investment} - ${contents}`);
-  const verifiedApprovedDetail = state => verifiedDetailRow(state) && normalizeApproved(state.rows.find(row=>row.detail)?.description) === approvedDescription;
+  const allowedDescriptions = new Set(
+    (Array.isArray(allowedDetailDescriptions) && allowedDetailDescriptions.length
+      ? allowedDetailDescriptions.map(normalizeApproved)
+      : [approvedDescription]),
+  );
+  const rawFbrCandidates = Array.isArray(allowedFbrPrepopulatedRows) && allowedFbrPrepopulatedRows.length
+    ? allowedFbrPrepopulatedRows
+    : Array.isArray(expectedValues) && expectedValues.length === 2
+      ? [{ values: expectedValues, expectedChargeable }]
+      : [];
+  const fbrCandidates = rawFbrCandidates
+    .filter((entry) => Array.isArray(entry?.values) && entry.values.length === 2 && entry.values.every((v) => /^\d+$/.test(String(v ?? ""))))
+    .map((entry) => {
+      const chg = entry.expectedChargeable ?? entry.chargeableExpected;
+      return {
+        gross: String(entry.values[0]),
+        tax: String(entry.values[1]),
+        chargeable: chg !== null && chg !== undefined ? String(chg) : null,
+      };
+    });
+  const rowMatchesCandidate = (row, candidate) => {
+    const cells = row?.cells || [];
+    if (cells.length !== FINAL_TAX_COLUMNS.length) return false;
+    if (digits(cells[0].value) !== candidate.gross) return false;
+    if (digits(cells[1].value) !== candidate.tax) return false;
+    if (candidate.chargeable !== null && digits(cells[2].value) !== candidate.chargeable) return false;
+    return true;
+  };
+  const matchUniqueFbrCandidateIndex = (row) => {
+    if (!row?.detail || !row?.labelMatched) return -1;
+    const desc = normalizeApproved(row.description);
+    if (allowedDescriptions.has(desc)) return -1;
+    const matches = fbrCandidates
+      .map((candidate, idx) => (rowMatchesCandidate(row, candidate) ? idx : -1))
+      .filter((idx) => idx !== -1);
+    return matches.length === 1 ? matches[0] : -1;
+  };
+  const allDetailsAllowed = state => {
+    const details = (state.rows || []).filter((row) => row.detail);
+    const seenAllowed = new Set();
+    const seenFbrCandidate = new Set();
+    for (const row of details) {
+      const desc = normalizeApproved(row.description);
+      if (allowedDescriptions.has(desc)) {
+        if (seenAllowed.has(desc)) return false;
+        seenAllowed.add(desc);
+        continue;
+      }
+      const candidateIdx = matchUniqueFbrCandidateIndex(row);
+      if (candidateIdx === -1 || seenFbrCandidate.has(candidateIdx)) return false;
+      seenFbrCandidate.add(candidateIdx);
+    }
+    return details.length <= Math.max(allowedDescriptions.size, fbrCandidates.length || 1);
+  };
+  const verifiedApprovedDetail = state =>
+    verifiedParentWithDetails(state) &&
+    allDetailsAllowed(state) &&
+    (state.rows || []).filter((row) => row.detail && normalizeApproved(row.description) === approvedDescription).length === 1;
+  const verifiedPrepopulatedMatch = state => {
+    if (!Array.isArray(expectedValues) || expectedValues.length !== 2)
+      return false;
+    if (!expectedValues.every((v) => /^\d+$/.test(String(v ?? "")))) return false;
+    if (!verifiedParentWithDetails(state) || !allDetailsAllowed(state)) return false;
+    const ownTarget = {
+      gross: String(expectedValues[0]),
+      tax: String(expectedValues[1]),
+      chargeable: expectedChargeable !== null && expectedChargeable !== undefined ? String(expectedChargeable) : null,
+    };
+    const matchingCandidates = fbrCandidates
+      .map((candidate, idx) =>
+        candidate.gross === ownTarget.gross &&
+        candidate.tax === ownTarget.tax &&
+        candidate.chargeable === ownTarget.chargeable
+          ? idx
+          : -1,
+      )
+      .filter((idx) => idx !== -1);
+    if (matchingCandidates.length !== 1) return false;
+    const myIdx = matchingCandidates[0];
+    const details = (state.rows || []).filter((row) => row.detail);
+    return details.filter((row) => matchUniqueFbrCandidateIndex(row) === myIdx).length === 1;
+  };
+  const readyForAdditionalDetail = state =>
+    verifiedParentWithDetails(state) &&
+    allDetailsAllowed(state) &&
+    !verifiedPrepopulatedMatch(state) &&
+    !(state.rows || []).some((row) => row.detail && normalizeApproved(row.description) === approvedDescription);
 
   const setup = [];
   const note = (step, detail) => {
@@ -696,7 +822,7 @@ async function ensureBankProfitFinalTaxRow(windowInstance, options = {}) {
       );
     current = await inspect();
     if (
-      !verifiedParentOnlyRow(current) ||
+      (!verifiedParentOnlyRow(current) && !readyForAdditionalDetail(current)) ||
       current.dialogs?.length !== 1 ||
       current.dialogs[0] !== INVESTMENT_DIALOG_TITLE
     )
@@ -763,7 +889,9 @@ async function ensureBankProfitFinalTaxRow(windowInstance, options = {}) {
       "The active Final Tax grid/header did not match the verified three-column layout; no row was added.",
       { cancel: !readOnly && state.dialogs.includes(DIALOG_TITLE) },
     );
-  if (verifiedApprovedDetail(state) || verifiedDirectSukukRow(state, target.code)) {
+  const exactDetailMatch = verifiedApprovedDetail(state);
+  const prepopulatedMatch = !exactDetailMatch && verifiedPrepopulatedMatch(state);
+  if (exactDetailMatch || prepopulatedMatch || verifiedDirectSukukRow(state, target.code)) {
     if (state.dialogs.includes(INVESTMENT_DIALOG_TITLE))
       return fail(
         "unexpected_investment_dialog",
@@ -774,21 +902,27 @@ async function ensureBankProfitFinalTaxRow(windowInstance, options = {}) {
         "chooser_close_failed",
         `The existing ${target.code} row is valid, but its Add Final Tax dialog could not be safely cancelled; filling was held.`,
       );
-    note("row_present", `The existing ${target.code} writable row contract was verified; no ADD was needed.`);
-    return { ok: true, status: "row_present", added: false, setup };
+    note(
+      "row_present",
+      prepopulatedMatch
+        ? `The existing FBR-populated ${target.code} detail row already matches the approved certificate amounts; no ADD was needed.`
+        : `The existing ${target.code} writable row contract was verified; no ADD was needed.`,
+    );
+    return { ok: true, status: "row_present", added: false, ...(prepopulatedMatch ? { verifiedPrepopulatedMatch: true } : {}), setup };
   }
   const parentOnly = verifiedParentOnlyRow(state);
-  if ((state.rows || []).length && !parentOnly) {
+  const canAddAdditionalDetail = readyForAdditionalDetail(state);
+  if ((state.rows || []).length && !parentOnly && !canAddAdditionalDetail) {
     return fail(
       "row_layout_unverified",
       `IRIS shows code ${target.code}, but its parent/detail row shape is not the verified contract. No ADD was clicked.`,
       { cancel: !readOnly && state.dialogs.includes(DIALOG_TITLE) },
     );
   }
-  if (readOnly && parentOnly)
+  if (readOnly && (parentOnly || canAddAdditionalDetail))
     return fail(
       mode === "dry" ? "row_detail_missing_dry" : "row_detail_missing_verify_only",
-      `Code ${target.code} has only its read-only parent row. This run is read-only, so the Investment detail popup was not used.`,
+      `Code ${target.code} does not yet contain this certificate's Investment detail row. This run is read-only, so the Investment detail popup was not used.`,
     );
   if (readOnly)
     return fail(
@@ -806,7 +940,7 @@ async function ensureBankProfitFinalTaxRow(windowInstance, options = {}) {
       "investment_details_missing",
       "The approved packet does not contain valid Bank Profit Investment and Contents values. Generate a fresh packet from the approved certificate; nothing was clicked.",
     );
-  if (parentOnly) return addInvestmentDetail(false);
+  if (parentOnly || canAddAdditionalDetail) return addInvestmentDetail(false);
 
   const dialogOpen = state.dialogs.includes(DIALOG_TITLE);
   if (!dialogOpen) {
@@ -1011,6 +1145,55 @@ async function ensureBankProfitFinalTaxRow(windowInstance, options = {}) {
   return { ok: true, status: "row_added", added: true, setup };
 }
 
+/**
+ * Trigger IRIS Calculate once for verified direct Sukuk rows (64330054/64330055)
+ * ONLY when Tax Chargeable remains disabled and blank after col 0/1 entry.
+ * Non-Sukuk codes are strictly forbidden, and already-populated col 2 is never clicked.
+ */
+async function calculateBankProfitFinalTax(windowInstance, options = {}) {
+  const {
+    code,
+    mode = "dry",
+    expectedChargeable,
+    beforeStep,
+    onStep = () => {},
+    sleep = defaultSleep,
+    timeoutMs = 8000,
+  } = options;
+  const targetCode = String(code || "");
+  const expected = String(expectedChargeable ?? "").replace(/[\s,]/g, "");
+  if (mode !== "live") return { ok: false, status: "calculate_not_live" };
+  if (typeof beforeStep !== "function")
+    return { ok: false, status: "identity_guard_required" };
+  if (!SUKUK_CODES.includes(targetCode) || !/^\d+$/.test(expected))
+    return { ok: false, status: "calculate_target_unverified" };
+  const run = async (step) => {
+    await beforeStep();
+    return windowInstance.webContents.executeJavaScript(buildPageScript(step, targetCode));
+  };
+  const initial = await run({ op: "inspect" });
+  if (!verifiedDirectSukukRow(initial, targetCode))
+    return { ok: false, status: "calculate_row_unverified" };
+  const current = String(initial.rows[0].cells[2].value || "").replace(/[\s,]/g, "");
+  if (current === expected) return { ok: true, status: "already_calculated" };
+  if (current) return { ok: false, status: "calculate_existing_mismatch" };
+  const clicked = await run({ op: "calculate" });
+  if (clicked.status !== "clicked")
+    return { ok: false, status: `calculate_${clicked.status}` };
+  const deadline = Date.now() + timeoutMs;
+  let snapshot;
+  do {
+    snapshot = await run({ op: "inspect" });
+    const value = String(snapshot.rows?.[0]?.cells?.[2]?.value || "").replace(/[\s,]/g, "");
+    if (verifiedDirectSukukRow(snapshot, targetCode) && value === expected) {
+      onStep("bank_profit_calculated", `${targetCode} Tax Chargeable was recalculated and verified in IRIS. Save and Submit were not used.`);
+      return { ok: true, status: "calculated" };
+    }
+    await sleep(250);
+  } while (Date.now() < deadline);
+  return { ok: false, status: "calculate_readback_unverified" };
+}
+
 module.exports = {
   BANK_PROFIT_CODE,
   BANK_PROFIT_CODES,
@@ -1026,6 +1209,7 @@ module.exports = {
   assertAllowedStep,
   bankProfitPageOp,
   buildPageScript,
+  calculateBankProfitFinalTax,
   ensureBankProfitFinalTaxRow,
   verifiedDetailRow,
   verifiedDirectSukukRow,

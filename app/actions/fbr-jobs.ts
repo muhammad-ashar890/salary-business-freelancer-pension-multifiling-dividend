@@ -8,6 +8,14 @@ import { getNextFbrPilotPhase } from "@/lib/tax/fbr-job-resume";
 import { JOB_STATUSES, JOB_TYPES } from "@/lib/tax/fbr-desktop";
 import { businessOwnershipPacketValidationError } from "@/lib/tax/business-ownership-packet-validation";
 import { visibleBusinessPendingLabels } from "@/lib/tax/business-filing";
+import {
+  buildFallbackPauseDetails,
+  readJobPauseDetails,
+  type JobPauseDetails,
+  type JobPauseRow,
+} from "@/lib/tax/fbr-pause-details";
+
+export type { JobPauseDetails, JobPauseRow };
 
 async function getOwnedDraft(draftId: string) {
   const session = await getServerSession(authOptions);
@@ -503,6 +511,8 @@ export async function getLocalAgentJobsAction(draftId: string) {
           gapSide: "missing_inflow" | "missing_outflow" | null;
           message: string;
         };
+        bankProfit?: string | null;
+        dividend?: string | null;
         save?: HandoffSaveState;
       } | null = null;
       let attention: JobAttention | null = null;
@@ -510,6 +520,16 @@ export async function getLocalAgentJobsAction(draftId: string) {
         attention = readJobAttention(parsedResult?.attention);
       } catch {
         attention = null;
+      }
+      let pauseDetails: JobPauseDetails | null = null;
+      try {
+        if (job.status === JOB_STATUSES.AWAITING_USER_ACTION || job.pauseAction || job.pauseMessage) {
+          pauseDetails =
+            readJobPauseDetails(parsedResult?.pauseDetails ?? autofillResult?.pauseDetails) ??
+            buildFallbackPauseDetails(job.pauseAction, job.pauseMessage, parsedResult);
+        }
+      } catch {
+        pauseDetails = null;
       }
       try {
         const scope = parsedResult?.handoffScope;
@@ -554,7 +574,7 @@ export async function getLocalAgentJobsAction(draftId: string) {
                     id: String(scope.route.id || "unscoped").slice(0, 80),
                     label: scope.route.label.slice(0, 120),
                     incomeSources: (Array.isArray(scope.route.incomeSources) ? scope.route.incomeSources : [])
-                      .filter((source: unknown) => ["salary", "business", "pension", "services"].includes(String(source)))
+                      .filter((source: unknown) => ["salary", "business", "pension", "services", "bank_profit", "dividend"].includes(String(source)))
                       .map(String)
                       .slice(0, 8),
                   },
@@ -655,12 +675,18 @@ export async function getLocalAgentJobsAction(draftId: string) {
                 }
               : {}),
             ...readHandoffSave(scope.save),
+            ...(typeof scope.bankProfit === "string"
+              ? { bankProfit: scope.bankProfit.slice(0, 60) }
+              : {}),
+            ...(typeof scope.dividend === "string"
+              ? { dividend: scope.dividend.slice(0, 60) }
+              : {}),
           };
         }
       } catch {
         handoffScope = null;
       }
-      return { ...job, handoffScope, attention };
+      return { ...job, handoffScope, attention, pauseDetails };
     });
 
     return { success: true, jobs: views };
@@ -891,7 +917,36 @@ export async function getTrustedDevicesAction(draftId?: string) {
       },
     });
 
-    return { success: true, devices };
+    const activeDevice = devices.find(
+      (d) => d.status === "ACTIVE" && Boolean(d.lastSeenAt),
+    );
+    let fbrWindowOpen = Boolean(activeDevice?.localFbrConnectedAt);
+    if (activeDevice && !fbrWindowOpen) {
+      try {
+        const latestWindowEvent = await prisma.taxAuditEvent?.findFirst?.({
+          where: {
+            deviceId: activeDevice.id,
+            eventType: {
+              in: [
+                "DEVICE_READY",
+                "DEVICE_FBR_WINDOW_OPEN",
+                "DEVICE_FBR_DISCONNECTED",
+                "DEVICE_REGISTERED",
+              ],
+            },
+          },
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+          select: { eventType: true },
+        });
+        fbrWindowOpen =
+          latestWindowEvent?.eventType === "DEVICE_FBR_WINDOW_OPEN" ||
+          latestWindowEvent?.eventType === "DEVICE_READY";
+      } catch {
+        // Optional audit lookup fallback.
+      }
+    }
+
+    return { success: true, devices, fbrWindowOpen };
   } catch (error) {
     console.error("Error fetching devices:", error);
     return { success: false, error: "Failed to fetch devices" };

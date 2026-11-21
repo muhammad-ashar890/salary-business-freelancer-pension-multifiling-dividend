@@ -402,6 +402,135 @@ export function readApprovedBankProfitCertificate(
   };
 }
 
+/**
+ * Matches the certificate's own printed arithmetic line, e.g.
+ * "Arithmetic check: PKR 240,000.00 gross profit - PKR 36,000.00 tax withheld
+ *  = PKR 204,000.00 net credited." Also tolerates the "gross − … withholding =
+ * … net credited" reconciliation wording (unicode minus included).
+ */
+const CERTIFICATE_ARITHMETIC_LINE_PATTERN =
+  /(?:PKR\s*)?([\d,]+(?:\.\d{1,2})?)\s*gross(?:\s+profit)?[^=\d]*?(?:PKR\s*)?([\d,]+(?:\.\d{1,2})?)\s*(?:tax\s*withheld|tax\s*deducted|withholding|withheld)[^=\d]*?=\s*(?:PKR\s*)?([\d,]+(?:\.\d{1,2})?)\s*net(?:\s+(?:credited|profit))?/gi;
+
+export const BANK_PROFIT_CERTIFICATE_RECOVERY_NOTE_PREFIX =
+  "Recovered from the certificate's printed arithmetic-check line:";
+
+/**
+ * Upload-time safety net for certificates whose model extraction left a
+ * PRINTED gross/tax/net amount unbound (observed 2026-10-30: the Sukuk
+ * company layout put every summary amount only into `notes`). This copies
+ * exact printed numbers — it never derives an unstated value: a triple is
+ * used only when every printed arithmetic line agrees with it AND it
+ * satisfies gross - tax = net. A field already holding a value is never
+ * overwritten: a conflicting printed triple stays for the human reviewer and
+ * the review validation keeps flagging it.
+ *
+ * Deliberately NOT part of ensureBankProfitCertificateReviewFields: the save
+ * path runs that helper on the human's edited payload, where a deliberately
+ * blanked field must stay blank. Recovery therefore runs only on the initial
+ * Gemini extraction path in app/actions/extraction.ts.
+ */
+export function recoverBankProfitCertificatePrintedAmounts(
+  extracted: unknown,
+): unknown {
+  if (!extracted || typeof extracted !== "object" || Array.isArray(extracted)) {
+    return extracted;
+  }
+  const payload = extracted as Record<string, unknown>;
+  const fields: BankProfitCertificateFieldLike[] = Array.isArray(payload.fields)
+    ? payload.fields.filter(
+        (field): field is BankProfitCertificateFieldLike =>
+          Boolean(field) && typeof field === "object" && !Array.isArray(field),
+      ).map(field => ({...field}))
+    : [];
+  const corpus = [
+    ...fields.map(
+      (field) => `${String(field.label ?? "")} ${String(field.value ?? "")}`,
+    ),
+    ...(Array.isArray(payload.notes)
+      ? payload.notes.map((note) => String(note ?? ""))
+      : []),
+  ].join("\n");
+
+  const triples: Array<{ gross: number; tax: number; net: number }> = [];
+  for (const match of corpus.matchAll(CERTIFICATE_ARITHMETIC_LINE_PATTERN)) {
+    const gross = parseBankProfitCertificateAmount(match[1]);
+    const tax = parseBankProfitCertificateAmount(match[2]);
+    const net = parseBankProfitCertificateAmount(match[3]);
+    if (gross === null || tax === null || net === null) continue;
+    if (
+      Math.round(gross * 100) - Math.round(tax * 100) !==
+      Math.round(net * 100)
+    )
+      continue; // internally inconsistent printed line — human review
+    triples.push({ gross, tax, net });
+  }
+  const unique = [
+    ...new Map(
+      triples.map((triple) => [
+        `${triple.gross}-${triple.tax}-${triple.net}`,
+        triple,
+      ]),
+    ).values(),
+  ];
+  if (unique.length !== 1) return extracted; // none printed, or conflicting prints
+  const recovered = unique[0];
+
+  let changed = false;
+  const recoveredFor: Array<{ kind: BankProfitCertificateFieldKind; amount: number }> = [];
+  const fill = (kind: BankProfitCertificateFieldKind, amount: number) => {
+    const entries = fields.filter(
+      (field) => getBankProfitCertificateFieldKind(field.label) === kind,
+    );
+    const target = entries[0];
+    if (!target) {
+      fields.push({
+        label: BANK_PROFIT_CERTIFICATE_LABELS[kind],
+        value: amount,
+        confidence: 1,
+      });
+      recoveredFor.push({ kind, amount });
+      changed = true;
+      return;
+    }
+    if (!isMissing(target.value)) {
+      const existing = parseBankProfitCertificateAmount(target.value);
+      if (existing !== null && Math.round(existing * 100) === Math.round(amount * 100))
+        return; // already matches the printed line
+      return; // conflicting value — leave to the review validation, never overwrite
+    }
+    target.value = amount;
+    if (typeof target.confidence !== "number" || target.confidence <= 0) {
+      target.confidence = 1; // exact printed copy; provenance note explains
+    }
+    recoveredFor.push({ kind, amount });
+    changed = true;
+  };
+  fill("grossAnnualProfit", recovered.gross);
+  fill("taxDeducted", recovered.tax);
+  fill("netProfitCredited", recovered.net);
+  if (!changed) return extracted;
+
+  const notes: unknown[] = Array.isArray(payload.notes) ? [...payload.notes] : [];
+  if (
+    !notes.some(
+      (note) =>
+        typeof note === "string" &&
+        note.startsWith(BANK_PROFIT_CERTIFICATE_RECOVERY_NOTE_PREFIX),
+    )
+  ) {
+    const parts = recoveredFor
+      .map(
+        ({ kind, amount }) =>
+          `${BANK_PROFIT_CERTIFICATE_LABELS[kind]} ${formatAmount(amount)}`,
+      )
+      .join(", ");
+    notes.push(
+      `${BANK_PROFIT_CERTIFICATE_RECOVERY_NOTE_PREFIX} exact printed amounts copied into empty review fields: ${parts}. Verify each against the certificate before approving.`,
+    );
+  }
+  return { ...payload, fields, notes };
+}
+
 export function ensureBankProfitCertificateReviewFields(extracted: unknown): unknown {
   if (!extracted || typeof extracted !== "object" || Array.isArray(extracted)) {
     return extracted;
@@ -425,4 +554,42 @@ export function ensureBankProfitCertificateReviewFields(extracted: unknown): unk
   }
 
   return { ...payload, fields };
+}
+
+const CATEGORY_SECTION_PATTERNS: Record<string, RegExp> = {
+  "bank-or-financial-institution-deposit": /\b151\s*\(\s*1\s*\)\s*\(\s*b\s*\)/i,
+  "other-profit-on-debt": /\b151\s*\(\s*1\s*\)\s*\(\s*d\s*\)/i,
+  "sukuk-individual-aop-above-1m": /\b151\s*\(\s*1\s*a\s*\)/i,
+  "sukuk-individual-aop-below-1m": /\b151\s*\(\s*1\s*a\s*\)/i,
+};
+
+/** Verifies that an approved certificate matches the selected Bank Profit slot category. */
+export function bankProfitCertificateCategoryError(
+  certificate: ApprovedBankProfitCertificate,
+  bankProfitSubcategory: string | null | undefined,
+): string | null {
+  if (!bankProfitSubcategory) return null;
+  const sectionPattern = CATEGORY_SECTION_PATTERNS[bankProfitSubcategory];
+  if (!sectionPattern) {
+    return `Bank Profit category ${bankProfitSubcategory} is not supported for automatic filing.`;
+  }
+  if (!sectionPattern.test(certificate.printedSectionSubsection)) {
+    return `Printed section "${certificate.printedSectionSubsection}" does not match selected category "${bankProfitSubcategory}". Re-upload or correct the certificate.`;
+  }
+  if (bankProfitSubcategory.startsWith("sukuk-")) {
+    const holder = String(certificate.sukukHolderType ?? "").trim().toLowerCase();
+    const band = String(certificate.sukukReturnBand ?? "").trim().toLowerCase();
+    if (holder !== "individual") {
+      return "Myself Sukuk certificates must explicitly identify an Individual holder.";
+    }
+    const above = bankProfitSubcategory.endsWith("above-1m");
+    if (
+      above
+        ? !/\babove\b/.test(band) || certificate.grossAnnualProfit <= 1000000
+        : !/\bbelow\b/.test(band) || certificate.grossAnnualProfit >= 1000000
+    ) {
+      return `Sukuk return band and amount do not match selected category "${bankProfitSubcategory}".`;
+    }
+  }
+  return null;
 }

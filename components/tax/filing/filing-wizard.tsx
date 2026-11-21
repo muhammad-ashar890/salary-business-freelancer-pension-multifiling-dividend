@@ -167,11 +167,17 @@ const DOCUMENT_KINDS_REQUIRING_APPROVAL = [
  * document up by a single spelling therefore compared "<kind>:<id>" against
  * "<kind>" and never matched, so every required slot read as "missing".
  */
-function findDocumentForSlot<D extends { documentType: string }>(
+function findDocumentForSlot<D extends { id?: string; documentType: string }>(
   documents: readonly D[],
   slot: { documentType: string; slotKey?: string },
 ): D | undefined {
   const slotKey = slot.slotKey ?? slot.documentType;
+  const hashIndex = slotKey.indexOf("#");
+  if (hashIndex !== -1) {
+    const docId = slotKey.slice(hashIndex + 1);
+    const byId = documents.find((document) => document.id === docId);
+    if (byId) return byId;
+  }
   // 1. The slot's own key: exact, and the only match that is instance-correct.
   const exact = documents.find((document) => document.documentType === slotKey);
   if (exact) return exact;
@@ -189,6 +195,23 @@ function findDocumentForSlot<D extends { documentType: string }>(
     return documents.find((document) => document.documentType === slot.documentType);
   }
   return undefined;
+}
+
+function indexFilingDocumentsBySlot(
+  documents: ReadonlyArray<FilingDocumentRecord & { documentType: string }>,
+) {
+  const records: Record<string, FilingDocumentRecord> = {};
+  const names: Record<string, string> = {};
+  for (const document of documents) {
+    const slotKey =
+      document.documentType.startsWith("bank_certificate:") &&
+      document.documentType in records
+        ? `${document.documentType}#${document.id}`
+        : document.documentType;
+    records[slotKey] = document as FilingDocumentRecord;
+    names[slotKey] = document.fileName;
+  }
+  return { records, names };
 }
 
 /**
@@ -620,13 +643,10 @@ export function FilingWizard({
       const result = await getFilingDocumentsAction(draftId);
       if (!isMounted || !result.success) return;
 
-      const nextRecords: Record<string, FilingDocumentRecord> = {};
-      const nextNames: Record<string, string> = {};
-
-      for (const document of result.documents) {
-        nextRecords[document.documentType] = document as FilingDocumentRecord;
-        nextNames[document.documentType] = document.fileName;
-      }
+      const { records: nextRecords, names: nextNames } =
+        indexFilingDocumentsBySlot(
+          result.documents as Array<FilingDocumentRecord & { documentType: string }>,
+        );
 
       setDocumentRecords(nextRecords);
       setUploadedDocuments(nextNames);
@@ -905,11 +925,50 @@ export function FilingWizard({
       });
 
     const bankProfitLabels = new Map(getTy2026SubcategoryOptions("bank_profit").map(option => [option.subcategory,option.label]));
-    const bankProfitSlots = incomeSubcategorySelections.filter(selection => selection.source === "bank_profit").map(selection => ({
-      documentType:"bank_certificate", slotKey:`bank_certificate:${selection.subcategory}`,
-      label:`Bank Profit Certificate — ${bankProfitLabels.get(selection.subcategory) ?? selection.subcategory}`,
-      reason:"Upload this category's printed gross profit, actual withholding and net-credit certificate.", required:true,
-    }));
+    const multiCertBankProfitCategories = new Set([
+      "bank-or-financial-institution-deposit",
+      "other-profit-on-debt",
+    ]);
+    const extraKeysForBase = (baseKey: string) =>
+      Array.from(
+        new Set([
+          ...Object.keys(documentRecords).filter((key) => key.startsWith(`${baseKey}#`)),
+          ...Object.keys(uploadedDocuments).filter((key) => key.startsWith(`${baseKey}#`)),
+        ]),
+      );
+    const bankProfitSlots = incomeSubcategorySelections
+      .filter((selection) => selection.source === "bank_profit")
+      .flatMap((selection) => {
+        const baseKey = `bank_certificate:${selection.subcategory}`;
+        const label =
+          bankProfitLabels.get(selection.subcategory) ?? selection.subcategory;
+        const supportsMulti = multiCertBankProfitCategories.has(
+          selection.subcategory,
+        );
+        const extraKeys = supportsMulti ? extraKeysForBase(baseKey) : [];
+        return [
+          {
+            documentType: "bank_certificate",
+            slotKey: baseKey,
+            label: `Bank Profit Certificate — ${label}`,
+            reason:
+              "Upload this category's printed gross profit, actual withholding and net-credit certificate.",
+            required: true,
+            allowAddBankProfitCertificate: supportsMulti,
+            removableDocument: supportsMulti && extraKeys.length > 0,
+          },
+          ...extraKeys.map((extraKey, index) => ({
+            documentType: "bank_certificate",
+            slotKey: extraKey,
+            label: `Bank Profit Certificate (${index + 2}) — ${label}`,
+            reason:
+              "Additional bank or investment profit certificate for this category.",
+            required: true,
+            allowAddBankProfitCertificate: false,
+            removableDocument: true,
+          })),
+        ];
+      });
     return [
       ...baseDocumentSlots.filter(
         (slot) => slot.documentType !== "bank_statement" &&
@@ -920,7 +979,7 @@ export function FilingWizard({
       ...(incomeSources.includes("bank_profit") ? bankProfitSlots : []),
       ...(incomeSources.includes("dividend") ? dividendSlots : []),
     ];
-  }, [baseDocumentSlots, bankAccounts, isMyself, taxYear, incomeSources, incomeSubcategorySelections]);
+  }, [baseDocumentSlots, bankAccounts, documentRecords, uploadedDocuments, isMyself, taxYear, incomeSources, incomeSubcategorySelections]);
 
   const requiredDocumentTypes = getRequiredTaxDocumentTypesForCurrentFlow({
     incomeSources,
@@ -2230,6 +2289,7 @@ export function FilingWizard({
 
   function goBack() {
     const previousStep = Math.max(0, currentStepRef.current - 1);
+    setFilingActionError(null);
     currentStepRef.current = previousStep;
     setStep(previousStep);
   }
@@ -2337,7 +2397,14 @@ export function FilingWizard({
               );
             });
 
-        if (notReady.length > 0) {
+          const allBankCertificatesNotReady = documents.some(
+            (document) =>
+              document.documentType.startsWith("bank_certificate:") &&
+              (documentNeedsReview(document) ||
+                document.extractionStatus !== "MAPPED"),
+          );
+
+        if (notReady.length > 0 || allBankCertificatesNotReady) {
           setFilingActionError(
             "Complete the Required fields, then review and approve/map all required documents before continuing.",
           );
@@ -2616,9 +2683,12 @@ export function FilingWizard({
           fileName: file.name,
         });
 
+        const baseDocumentType = documentType.split("#")[0];
+        const isAppend = documentType.includes("#");
         const uploadData = new FormData();
         uploadData.set("draftId", createdDraftId);
-        uploadData.set("documentType", documentType);
+        uploadData.set("documentType", baseDocumentType);
+        if (isAppend) uploadData.set("appendDocument", "true");
         uploadData.set("file", file);
 
         const uploadResult = await uploadFilingDocumentAction(uploadData);
@@ -2675,13 +2745,12 @@ export function FilingWizard({
       // overwrite the newly uploaded records with an empty response.
       const refreshedDocuments = await getFilingDocumentsAction(createdDraftId);
       if (refreshedDocuments.success) {
-        const nextRecords: Record<string, FilingDocumentRecord> = {};
-        const nextNames: Record<string, string> = {};
-
-        for (const document of refreshedDocuments.documents) {
-          nextRecords[document.documentType] = document as FilingDocumentRecord;
-          nextNames[document.documentType] = document.fileName;
-        }
+        const { records: nextRecords, names: nextNames } =
+          indexFilingDocumentsBySlot(
+            refreshedDocuments.documents as Array<
+              FilingDocumentRecord & { documentType: string }
+            >,
+          );
 
         setDocumentRecords(nextRecords);
         setUploadedDocuments(nextNames);
@@ -2839,7 +2908,7 @@ export function FilingWizard({
         )}
       <WizardDocumentsStep
         draftId={isMyself && taxYear === 2026 ? draftId : null}
-        onManualRecordSaved={() => { setBusinessIntakeLoadedFor(null); setBusinessIntakeIssues(null); void resetDownstreamSteps(step); void getFilingDocumentsAction(draftId!).then(result => { if (!result.success) return; const records: Record<string, FilingDocumentRecord> = {}; const names: Record<string, string> = {}; for (const document of result.documents) { records[document.documentType] = document as FilingDocumentRecord; names[document.documentType] = document.fileName; } setDocumentRecords(records); setUploadedDocuments(names); }); }}
+        onManualRecordSaved={() => { setBusinessIntakeLoadedFor(null); setBusinessIntakeIssues(null); void resetDownstreamSteps(step); void getFilingDocumentsAction(draftId!).then(result => { if (!result.success) return; const { records, names } = indexFilingDocumentsBySlot(result.documents as Array<FilingDocumentRecord & { documentType: string }>); setDocumentRecords(records); setUploadedDocuments(names); }); }}
         taxYear={taxYear}
         openingBalanceWarning={bankOpeningWarning}
         previousReturnRequiredByFiler={
@@ -3103,6 +3172,7 @@ export function FilingWizard({
         summaryRows={summaryRows}
         blockers={currentBlockers}
         onRailItemClick={(index) => {
+          setFilingActionError(null);
           currentStepRef.current = index;
           setStep(index);
         }}

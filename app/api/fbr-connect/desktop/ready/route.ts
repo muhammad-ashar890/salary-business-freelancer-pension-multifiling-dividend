@@ -20,7 +20,7 @@ export async function POST(req: NextRequest) {
       (body as any)?.deviceToken ||
       (body as any)?.deviceAuthToken ||
       bearerToken;
-    const { filingDraftId } = body as any;
+    const { filingDraftId, connected, reason, fbrWindowOpen } = body as any;
 
     if (!deviceToken) {
       return NextResponse.json(
@@ -44,6 +44,68 @@ export async function POST(req: NextRequest) {
         { success: false, error: "Invalid or inactive device" },
         { status: 401 },
       );
+    }
+
+    if (connected === false) {
+      const quitDisconnect = reason === "agent_quit";
+      const windowOpen = !quitDisconnect && Boolean(fbrWindowOpen);
+      const updatedDevice = await prisma.trustedDevice.update({
+        where: { id: device.id },
+        data: {
+          localFbrConnectedAt: null,
+          lastSeenAt: quitDisconnect ? null : new Date(),
+        },
+      });
+      try {
+        await prisma.fbrConnection?.updateMany?.({
+          where: {
+            userId: device.userId,
+            status: { in: ["WAITING_FOR_AGENT", "AGENT_CONNECTED"] },
+            ...(filingDraftId ? { filingDraftId } : {}),
+          },
+          data: {
+            status: "WAITING_FOR_AGENT",
+            message: windowOpen
+              ? "FBR IRIS window is open. Sign in to FBR in that window to continue."
+              : "FBR window closed or disconnected. Reconnect securely to open FBR.",
+            lastHeartbeat: new Date(),
+          },
+        });
+      } catch {
+        // Optional connection cleanup must not block disconnect ack.
+      }
+      try {
+        await prisma.taxAuditEvent?.create?.({
+          data: {
+            userId: device.userId,
+            filingDraftId: filingDraftId || null,
+            deviceId: device.id,
+            eventType: windowOpen
+              ? "DEVICE_FBR_WINDOW_OPEN"
+              : "DEVICE_FBR_DISCONNECTED",
+            eventDataJson: JSON.stringify({
+              partitionKey: device.partitionKey,
+              reason:
+                typeof reason === "string" ? reason.slice(0, 80) : "disconnected",
+              fbrWindowOpen: windowOpen,
+            }),
+          },
+        });
+      } catch {
+        // Optional audit event.
+      }
+      return NextResponse.json({
+        success: true,
+        ok: true,
+        connected: false,
+        fbrWindowOpen: windowOpen,
+        device: {
+          id: updatedDevice.id,
+          partitionKey: updatedDevice.partitionKey,
+          localFbrConnectedAt: null,
+          status: updatedDevice.status,
+        },
+      });
     }
 
     // Update device ready timestamp

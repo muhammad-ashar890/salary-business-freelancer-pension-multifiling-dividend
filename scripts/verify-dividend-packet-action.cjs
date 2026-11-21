@@ -124,5 +124,5 @@ test("packet action tests do not rewrite the production source or bypass admissi
  const self=fs.readFileSync(__filename,"utf8");assert.equal(self.includes("source." + "slice("),false);
  const source=fs.readFileSync(path.join(root,"app/actions/packet.ts"),"utf8");
  assert.match(source,/Capital Gains packet\/desktop integration is not enabled yet/);
- assert.match(source,/Bank Profit packets remain blocked by default/);
+ assert.match(source,/Bank Profit packets support only TY2026 Myself Bank Profit-only filings/);
 });

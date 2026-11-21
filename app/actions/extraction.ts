@@ -1,6 +1,11 @@
 "use server";
 import { capitalGainsExtractionInstruction } from "@/lib/tax/capital-gains-extraction-prompt";
 import { buildCapitalGainsApprovedEvidence } from "@/lib/tax/capital-gains-approved-evidence";
+import {
+  bankProfitCertificateCategoryError,
+  readApprovedBankProfitCertificate,
+  recoverBankProfitCertificatePrintedAmounts,
+} from "@/lib/tax/bank-profit-certificate-fields";
 import { invalidateFilingForDocumentChange } from "@/lib/tax/document-invalidation";
 import { dividendAmountsFromExtraction, validateDividendCertificateAmounts } from "@/lib/tax/dividend-portal-map";
 import { BUSINESS_BOOKS_ANNUAL_LABELS } from "@/lib/tax/business-books-annual-labels";
@@ -326,7 +331,9 @@ Read the printed LABEL on the certificate and the value printed next to or benea
 - "Printed Section / Subsection" is the tax section printed on the certificate, e.g. "Section 151(1)(b)" or "151(1)(d)" or "Section 151(1A)". Copy it exactly as printed; never infer a section from the rate or the bank name.
 - "ATL / Non-ATL Status" is the printed taxpayer-list status ("ATL", "Non-ATL", "Active Taxpayer List", "Late Filer"). Copy the printed wording; do not infer it from anything else.
 - "Bank NTN" is the National Tax Number printed for the bank/institution, not the taxpayer's NTN.
-- "Bank-applied Withholding Rate (%)" is the rate the bank actually applied, printed on the certificate; keep it as printed (e.g. "15%").
+- "Bank-applied Withholding Rate (%)" is the rate the bank actually applied, printed on the certificate; when the certificate prints any percentage rate for the withholding (in the summary table or as a printed rate line, including one marked as a sample or illustrative rate), copy the printed number into "Bank-applied Withholding Rate (%)" as a plain number without the % sign; return null only when no rate is printed at all.
+
+A bank profit certificate is not a bank statement: return an empty "transactions" array even when the certificate prints a profit/withholding record row; those amounts belong in the fields above, never in transaction rows. Pay special attention to summary tables whose column headers wrap onto two lines (for example "Bank-applied Withholding / Rate (%)"): bind each printed value under "Gross Annual Profit / Yield", "Tax Deducted / Withheld", "Bank-applied Withholding Rate (%)", "ATL / Non-ATL Status" and "Net Profit Credited" in that column order.
 
 Amounts are whole PKR without commas and without the "PKR" prefix. "Gross Annual Profit / Yield" minus "Tax Deducted / Withheld" must equal "Net Profit Credited" as printed; copy each of the three exactly as printed and never recompute or balance them. "Currency" is the three-letter ISO code printed on the certificate (normally PKR). "Taxpayer CNIC" is the account holder's CNIC exactly as printed, including dashes. For a non-Sukuk certificate leave both Sukuk labels null.`
       : "";
@@ -1065,6 +1072,12 @@ function normalizeExtractedPayload(
   // place summary rows in the generic transaction array; never expose those
   // rows in the document UI as items to map into Bank Intelligence.
   if (expectedDocumentType === "invoice_summary" && declaredAsInvoiceSummary) {
+    return { ...payload, transactions: [] };
+  }
+
+  // Bank profit certificates are never bank statements; strip any phantom rows
+  // extracted from summary profit/withholding tables.
+  if (expectedDocumentType === "bank_certificate") {
     return { ...payload, transactions: [] };
   }
 
@@ -2120,11 +2133,15 @@ export async function approveAndMapExtractedDocumentAction(documentId: string) {
       if (!bankDraft) return {success:false,error:"Filing draft not found"};
       const errors = getDocumentReviewRequiredErrors("bank_certificate", fields, bankDraft.taxYear);
       if (errors.length) return {success:false,error:errors.join(" · ")};
+      const canonical = readApprovedBankProfitCertificate(fields, bankDraft.taxYear);
+      if (!canonical) return {success:false,error:"Review all required Bank Profit certificate fields before approving."};
+      const categoryError = bankProfitCertificateCategoryError(canonical, document.bankProfitSubcategory);
+      if (categoryError) return {success:false,error:categoryError};
       await prisma.$transaction(async tx => {
         await tx.document.update({where:{id:document.id},data:{extractionStatus:"MAPPED",extractionStartedAt:null}});
         if (document.filingDraftId) await invalidateFilingForDocumentChange(tx,document.filingDraftId,document.userId);
       });
-      return {success:true,mapping:"BANK_PROFIT_CERTIFICATE"};
+      return {success:true,mapping:"BANK_PROFIT_CERTIFICATE",certificate:canonical};
     }
 
     if (document.documentType === "dividend_certificate") {
@@ -2726,13 +2743,17 @@ export async function extractDocumentWithGeminiAction(documentId: string) {
       document.documentType === "pension_statement"
         ? ensurePensionStatementReviewFields(normalizedExtraction, true)
         : ensureReviewFields(document.documentType, normalizedExtraction);
+    const recoveredExtraction =
+      document.documentType === "bank_certificate"
+        ? recoverBankProfitCertificatePrintedAmounts(reviewExtraction)
+        : reviewExtraction;
     const storageExtraction = normalizeBusinessListFieldsForStorage(
-      reviewExtraction,
+      recoveredExtraction,
     );
     // Valid detail lists are stored canonically. An unreadable list is kept
     // for the review screen's row editor instead of being silently dropped.
     const extracted = storageExtraction.errors.length
-      ? reviewExtraction
+      ? recoveredExtraction
       : storageExtraction.payload;
 
     if (!validation.valid) {

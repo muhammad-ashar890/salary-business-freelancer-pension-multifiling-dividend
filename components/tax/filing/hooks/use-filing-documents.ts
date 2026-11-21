@@ -326,26 +326,45 @@ export function useFilingDocuments({
   async function handleDocumentFileSelected(
     documentType: string,
     fileList: FileList | null,
+    uploadOptions?: { append?: boolean },
   ) {
     const file = fileList?.[0];
     if (!file) return;
 
+    const append = Boolean(uploadOptions?.append);
+    const baseDocumentType = documentType.split("#")[0];
+    const targetSlotKey = append
+      ? `${baseDocumentType}#staged-${Date.now()}`
+      : documentType;
+
     setDocumentUploadError(null);
     setProfileSyncNote(null);
-    setUploadedDocuments((prev) => ({ ...prev, [documentType]: file.name }));
-    setSelectedDocumentFiles((prev) => ({ ...prev, [documentType]: file }));
 
-    if (!draftId) return;
+    if (!draftId) {
+      setUploadedDocuments((prev) => ({ ...prev, [targetSlotKey]: file.name }));
+      setSelectedDocumentFiles((prev) => ({ ...prev, [targetSlotKey]: file }));
+      return;
+    }
+
+    if (!append) {
+      setUploadedDocuments((prev) => ({ ...prev, [documentType]: file.name }));
+      setSelectedDocumentFiles((prev) => ({ ...prev, [documentType]: file }));
+    }
 
     setUploadingDocumentType(documentType);
     const uploadData = new FormData();
     uploadData.set("draftId", draftId);
-    uploadData.set("documentType", documentType);
+    uploadData.set("documentType", baseDocumentType);
+    if (append) {
+      uploadData.set("appendDocument", "true");
+    } else if (documentRecords[documentType]?.id) {
+      uploadData.set("replaceDocumentId", documentRecords[documentType].id);
+    }
     uploadData.set("file", file);
     void recordDocumentLifecycle({
       action: "upload.requested",
       draftId,
-      documentType,
+      documentType: baseDocumentType,
       fileName: file.name,
     });
 
@@ -353,22 +372,33 @@ export function useFilingDocuments({
     void recordDocumentLifecycle({
       action: result.success ? "upload.completed" : "upload.failed",
       draftId,
-      documentType,
+      documentType: baseDocumentType,
       documentId: result.success ? result.document.id : null,
       fileName: file.name,
       status: result.success ? result.document.extractionStatus : "FAILED",
     });
     setUploadingDocumentType(null);
-    setSelectedDocumentFiles((previous) => {
-      const next = { ...previous };
-      delete next[documentType];
-      return next;
-    });
+    if (!append) {
+      setSelectedDocumentFiles((previous) => {
+        const next = { ...previous };
+        delete next[documentType];
+        return next;
+      });
+    }
 
     if (result.success) {
+      const resolvedSlotKey = append
+        ? `${baseDocumentType}#${result.document.id}`
+        : documentType;
+      if (append) {
+        setUploadedDocuments((previous) => ({
+          ...previous,
+          [resolvedSlotKey]: result.document.fileName,
+        }));
+      }
       setDocumentRecords((previous) => ({
         ...previous,
-        [documentType]: {
+        [resolvedSlotKey]: {
           id: result.document.id,
           fileName: result.document.fileName,
           extractionStatus: result.document.extractionStatus,
@@ -383,11 +413,13 @@ export function useFilingDocuments({
     }
 
     setDocumentUploadError(result.error ?? "Failed to upload document");
-    setUploadedDocuments((prev) => {
-      const next = { ...prev };
-      delete next[documentType];
-      return next;
-    });
+    if (!append) {
+      setUploadedDocuments((prev) => {
+        const next = { ...prev };
+        delete next[documentType];
+        return next;
+      });
+    }
   }
 
   async function handleExtractDocument(documentType: string) {
@@ -840,7 +872,11 @@ export function useFilingDocuments({
 
     setDocumentRecords((previous) => ({
       ...previous,
-      [documentType]: { ...record, extractionStatus: "MAPPED" },
+      [documentType]: {
+        ...record,
+        extractionStatus: "MAPPED",
+        reviewRequiredErrors: [],
+      },
     }));
     // Mapping a bank statement stores its IBAN on the account.
     if (documentType.startsWith("bank_statement")) onBankAccountsChanged?.();
@@ -983,14 +1019,29 @@ export function useFilingDocuments({
         setDocumentUploadError(result.error ?? "Failed to remove the document");
         return;
       }
+      const promoteSiblingKey =
+        documentType.startsWith("bank_certificate:") &&
+        !documentType.includes("#")
+          ? Object.keys(documentRecords).find((key) =>
+              key.startsWith(`${documentType}#`),
+            )
+          : undefined;
       setDocumentRecords((previous) => {
         const next = { ...previous };
         delete next[documentType];
+        if (promoteSiblingKey && next[promoteSiblingKey]) {
+          next[documentType] = next[promoteSiblingKey];
+          delete next[promoteSiblingKey];
+        }
         return next;
       });
       setUploadedDocuments((previous) => {
         const next = { ...previous };
         delete next[documentType];
+        if (promoteSiblingKey && next[promoteSiblingKey]) {
+          next[documentType] = next[promoteSiblingKey];
+          delete next[promoteSiblingKey];
+        }
         return next;
       });
       setExtractedByDocumentId((previous) => {
@@ -1000,9 +1051,14 @@ export function useFilingDocuments({
         return next;
       });
       setSelectedDocumentFiles((previous) => {
-        if (!(documentType in previous)) return previous;
+        if (!(documentType in previous) && !(promoteSiblingKey && promoteSiblingKey in previous))
+          return previous;
         const next = { ...previous };
         delete next[documentType];
+        if (promoteSiblingKey && next[promoteSiblingKey]) {
+          next[documentType] = next[promoteSiblingKey];
+          delete next[promoteSiblingKey];
+        }
         return next;
       });
       // The steps downstream of Documents read the packet this document fed,

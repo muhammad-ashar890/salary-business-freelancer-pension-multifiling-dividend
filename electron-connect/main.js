@@ -46,6 +46,7 @@ let localBridgeServer = null;
 let autoCaptureTimer = null;
 let localWorkerTimer = null;
 let localWorkerRunning = false;
+let activeJobProcessing = false;
 let workerIdleAnnounced = false;
 // Points at the execution log of whichever flow (assisted/dry-run) is
 // currently running, so the failure handler in processLocalJob can persist
@@ -1480,7 +1481,7 @@ function applyLaunchUrl(rawValue) {
     focusPortalWindow();
     return true;
   }
-  if (localWorkerRunning) {
+  if (activeJobProcessing) {
     pushStatus(
       "error",
       "A filing is already in progress. Wait for it to pause before reconnecting.",
@@ -1535,9 +1536,10 @@ function applyLaunchUrl(rawValue) {
       ? "Connection request received. Opening FBR sign-in now."
       : "Connection request received. Opening MyDLD sign-in now.",
   );
-  void createLoginWindow(true).catch((error) =>
-    pushStatus("error", error.message || "Could not open FBR."),
-  );
+  void createLoginWindow(true).catch((error) => {
+    pushStatus("error", error.message || "Could not open FBR.");
+    startLocalWorkerLoop();
+  });
 
   return true;
 }
@@ -1553,7 +1555,7 @@ function applyLaunchPayload(payload) {
     focusPortalWindow();
     return true;
   }
-  if (localWorkerRunning) {
+  if (activeJobProcessing) {
     pushStatus(
       "error",
       "A filing is already in progress. Wait for it to pause before reconnecting.",
@@ -1615,9 +1617,10 @@ function applyLaunchPayload(payload) {
       ? "Connection request received. Opening FBR sign-in now."
       : "Connection request received. Opening MyDLD sign-in now.",
   );
-  void createLoginWindow(true).catch((error) =>
-    pushStatus("error", error.message || "Could not open FBR."),
-  );
+  void createLoginWindow(true).catch((error) => {
+    pushStatus("error", error.message || "Could not open FBR.");
+    startLocalWorkerLoop();
+  });
   return true;
 }
 
@@ -1760,6 +1763,11 @@ async function ensureWorkerWindow() {
 
   workerWindow.on("closed", () => {
     workerWindow = null;
+    if (!hasLivePortalWindow()) {
+      clearAutoCaptureTimer();
+      resetAutoCaptureState();
+      void notifyFbrDisconnected("portal_window_closed");
+    }
   });
 
   return workerWindow;
@@ -2589,6 +2597,58 @@ async function updateLocalJobStatus(jobId, status, body = {}) {
   });
 }
 
+function hasLivePortalWindow() {
+  return Boolean(
+    (loginWindow && !loginWindow.isDestroyed()) ||
+    (workerWindow && !workerWindow.isDestroyed()),
+  );
+}
+
+function isFbrPortalLive() {
+  const win =
+    (workerWindow && !workerWindow.isDestroyed() && workerWindow) ||
+    (loginWindow && !loginWindow.isDestroyed() && loginWindow) ||
+    null;
+  if (!win) return false;
+  if (localWorkerRunning) return true;
+  if (!autoCaptureState.completed) return false;
+  try {
+    return isCurrentPortalReadyUrl(win.webContents.getURL());
+  } catch {
+    return false;
+  }
+}
+
+async function notifyFbrDisconnected(
+  reason = "portal_disconnected",
+  fbrWindowOpen = hasLivePortalWindow(),
+) {
+  const deviceAuthToken =
+    launchState.deviceAuthToken || loadAgentState().deviceAuthToken;
+  const apiBaseUrl = getApiBaseUrl();
+  if (!deviceAuthToken || !apiBaseUrl) return null;
+  try {
+    const response = await fetch(
+      `${apiBaseUrl}${getTrustedDeviceReadyEndpoint()}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${deviceAuthToken}`,
+        },
+        body: JSON.stringify({
+          connected: false,
+          fbrWindowOpen: Boolean(fbrWindowOpen),
+          reason,
+        }),
+      },
+    );
+    return await response.json().catch(() => null);
+  } catch {
+    return null;
+  }
+}
+
 async function claimNextLocalJob() {
   const deviceAuthToken =
     launchState.deviceAuthToken || loadAgentState().deviceAuthToken;
@@ -2601,8 +2661,13 @@ async function claimNextLocalJob() {
   const payload = await fetchJson(`${apiBaseUrl}/api/local-agent/jobs/next`, {
     method: "POST",
     headers: {
+      "Content-Type": "application/json",
       Authorization: `Bearer ${deviceAuthToken}`,
     },
+    body: JSON.stringify({
+      fbrConnected: isFbrPortalLive(),
+      fbrWindowOpen: hasLivePortalWindow(),
+    }),
   });
 
   const job = payload?.job || null;
@@ -4038,18 +4103,54 @@ async function runLocalIrisNavigationCheck(jobContext, job) {
     ? irisDividendEntry.getDividendPacketRoute(snapshot) : null;
   if (dividendRoute && !dividendRoute.active) {
     const message = `Dividend packet refused (${dividendRoute.reason}). Regenerate and approve current evidence; nothing was changed in FBR.`;
-    return { paused: true, pauseAction: "portal_state_confirmation", pauseMessage: message, executionLog: [], result: { requiredAction: "portal_state_confirmation", message, submitted: false } };
+    const pauseDetails = {
+      title: "Dividend packet is missing required evidence",
+      summary: message,
+      tone: "red",
+      badge: "Packet check failed",
+      steps: [
+        "Open the Documents & Review steps in TaxRocket and verify your Dividend certificate(s).",
+        "Approve a fresh filing packet, then start FBR filing again.",
+      ],
+      safetyNote: "Nothing was changed, saved, or submitted in FBR.",
+      requiresFbrAction: false,
+    };
+    return { paused: true, pauseAction: "portal_state_confirmation", pauseMessage: message, pauseDetails, executionLog: [], result: { requiredAction: "portal_state_confirmation", message, pauseDetails, submitted: false } };
   }
 
   const bankProfitRoute = servicesRoute.incomeSources.includes("bank_profit") || snapshot?.otherSources?.bankProfit
     ? irisBankProfitEntry.getBankProfitPacketRoute(snapshot) : null;
   if (bankProfitRoute && !bankProfitRoute.active) {
     const message = `Bank Profit packet refused (${bankProfitRoute.reason}). Regenerate and approve current evidence; nothing was changed in FBR.`;
-    return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage:message,executionLog:[],result:{requiredAction:"portal_state_confirmation",message,submitted:false}};
+    const pauseDetails = {
+      title: "Bank Profit packet is missing required evidence",
+      summary: message,
+      tone: "red",
+      badge: "Packet check failed",
+      steps: [
+        "Open the Documents & Review steps in TaxRocket and verify your Bank Profit certificate(s).",
+        "Approve a fresh filing packet, then start FBR filing again.",
+      ],
+      safetyNote: "Nothing was changed, saved, or submitted in FBR.",
+      requiresFbrAction: false,
+    };
+    return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage:message,pauseDetails,executionLog:[],result:{requiredAction:"portal_state_confirmation",message,pauseDetails,submitted:false}};
   }
   if (bankProfitRoute?.active && (snapshot.business || snapshot.services || snapshot.pension || snapshot.computations || snapshot.otherSources?.taxDeductions || snapshot.portalFieldMapDetailed?.employers?.length || (snapshot.portalFieldMap && !Array.isArray(snapshot.portalFieldMap) && (snapshot.portalFieldMap.incomeFields?.length || snapshot.portalFieldMap.adjustableTaxFields?.length || snapshot.portalFieldMap.businessFields?.length || snapshot.portalFieldMap.employers?.length)) || (Array.isArray(snapshot.portalFieldMap) ? snapshot.portalFieldMap.some(field=>field.sourceGroup!=="wealthFields") : false))) {
     const message="Bank Profit dedicated-only packet contains unexpected schedules. Regenerate the approved packet; nothing was changed in FBR.";
-    return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage:message,executionLog:[],result:{message,submitted:false}};
+    const pauseDetails = {
+      title: "Bank Profit packet includes unsupported extra schedules",
+      summary: message,
+      tone: "red",
+      badge: "Packet check failed",
+      steps: [
+        "Regenerate and approve a fresh Bank Profit packet in TaxRocket.",
+        "Start FBR filing again once approved.",
+      ],
+      safetyNote: "Nothing was changed, saved, or submitted in FBR.",
+      requiresFbrAction: false,
+    };
+    return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage:message,pauseDetails,executionLog:[],result:{message,pauseDetails,submitted:false}};
   }
 
   // Combined Freelancer + Business: a Business payload AND a Services envelope
@@ -4202,6 +4303,26 @@ async function runLocalIrisNavigationCheck(jobContext, job) {
   if (!residencyStatus) {
     const pauseMessage =
       "Missing filing context: select Resident or Non-Resident in TaxRocket before starting FBR navigation. No portal action was taken.";
+    const pauseDetails = {
+      title: "Select Resident or Non-Resident before starting",
+      summary: "Your filing packet is missing a residency status.",
+      tone: "amber",
+      badge: "Missing context",
+      rows: [
+        {
+          label: "Residency status",
+          irisValue: "Required for new TY2026 returns",
+          packetValue: "Not set",
+          status: "needs_review",
+        },
+      ],
+      steps: [
+        "Open your filing in TaxRocket and choose Resident or Non-Resident.",
+        "Approve a fresh packet and start FBR filing again.",
+      ],
+      safetyNote: "No portal action was taken.",
+      requiresFbrAction: false,
+    };
     const executionLog = [
       {
         step: "missing_residency_context",
@@ -4214,6 +4335,7 @@ async function runLocalIrisNavigationCheck(jobContext, job) {
       requiredAction: "missing_residency_context",
       message: pauseMessage,
       pauseReason: pauseMessage,
+      pauseDetails,
       taxYear,
       submitted: false,
       navigationVerified: false,
@@ -4252,6 +4374,28 @@ async function runLocalIrisNavigationCheck(jobContext, job) {
       ? ` The recorded unresolved amount is PKR ${Math.abs(reconciliationGap).toLocaleString()}.`
       : "";
     const pauseMessage = `Your TaxRocket return data still needs reconciliation.${gapText} Resolve the outstanding amount before starting FBR. No portal action was taken.`;
+    const pauseDetails = {
+      title: "Resolve Wealth reconciliation in TaxRocket first",
+      summary: "Your TaxRocket filing still has an unresolved reconciliation gap.",
+      tone: "amber",
+      badge: "Reconciliation pending",
+      rows: Number.isFinite(reconciliationGap)
+        ? [
+            {
+              label: "Unreconciled amount in TaxRocket",
+              packetValue: `PKR ${Math.abs(reconciliationGap).toLocaleString()}`,
+              irisValue: "Must be PKR 0",
+              status: "differs",
+            },
+          ]
+        : [],
+      steps: [
+        "Open the Wealth / Reconciliation step in TaxRocket and resolve the difference so the gap is PKR 0.",
+        "Approve a fresh packet, then start FBR filing again.",
+      ],
+      safetyNote: "No portal action was taken in FBR IRIS.",
+      requiresFbrAction: false,
+    };
     const executionLog = [
       {
         step: "reconciliation_review_required",
@@ -4264,6 +4408,7 @@ async function runLocalIrisNavigationCheck(jobContext, job) {
       requiredAction: "portal_reconciliation_review",
       message: pauseMessage,
       pauseReason: pauseMessage,
+      pauseDetails,
       taxYear,
       submitted: false,
       navigationVerified: false,
@@ -4537,11 +4682,154 @@ async function runLocalIrisNavigationCheck(jobContext, job) {
     outcome.pauseMessage ||
     messages[outcome.requiredAction] ||
     messages.portal_inspection;
+  const navAction = outcome.requiredAction;
+  const navigationComplete = navAction === "portal_sections_inspected";
+  const navPauseDetails = navigationComplete
+    ? null
+    : {
+        portal_taxpayer_mismatch: {
+          title: "FBR taxpayer does not match this filing",
+          summary: pauseMessage,
+          tone: "red",
+          badge: "Taxpayer mismatch",
+          steps: [
+            "Check the signed-in CNIC / NTN in the open FBR IRIS window.",
+            "Sign out and log in with the matching FBR taxpayer account, or cancel and switch filing in TaxRocket.",
+          ],
+          safetyNote: "No tax values were entered, changed, saved, or submitted.",
+          requiresFbrAction: true,
+        },
+        portal_document_mismatch: {
+          title: "Open FBR return does not match this filing",
+          summary: pauseMessage,
+          tone: "red",
+          badge: "Return mismatch",
+          steps: [
+            `Open your Normal / Original 114(1) return for Tax Year ${taxYear} (12 months) in the FBR window.`,
+            "Once the right draft return is visible, choose Continue below.",
+          ],
+          safetyNote: "No tax values were entered, changed, saved, or submitted.",
+          requiresFbrAction: true,
+        },
+        portal_economic_transactions_gate: {
+          title: "Complete FBR return setup questions",
+          summary: pauseMessage,
+          tone: "amber",
+          badge: "Setup question",
+          rows: expectedEconomicSources.length
+            ? [
+                {
+                  label: "Expected FBR income sources",
+                  packetValue: expectedEconomicSources.join(", "),
+                  status: "needs_review",
+                },
+                {
+                  label: "Residency status",
+                  packetValue: residencyStatus === "Resident" ? "Yes (Resident)" : "No (Non-Resident)",
+                  status: "needs_review",
+                },
+              ]
+            : [],
+          steps: [
+            expectedEconomicSources.length > 0
+              ? `In the FBR window, select only: ${expectedEconomicSources.join(", ")}.`
+              : "In the FBR window, select the income sources matching your filing.",
+            `Select ${residencyStatus === "Resident" ? "Yes (Resident)" : "No (Non-Resident)"}, then choose Continue below.`,
+          ],
+          safetyNote: "Do not submit the return.",
+          requiresFbrAction: true,
+        },
+        portal_popup: {
+          title: "Close or complete the open dialog in FBR",
+          summary: pauseMessage,
+          tone: "amber",
+          badge: "Dialog open",
+          steps: [
+            openPortalDialogs.some((dialog) => dialog?.kind === "agent_picker")
+              ? "Press Cancel in the open IRIS picker dialog in the FBR window."
+              : "Complete any OTP / CAPTCHA / verification prompt in the FBR window, or close the banner/dialog.",
+            "Choose Continue below once the return screen is clear.",
+          ],
+          safetyNote: "The agent never bypasses protected dialogs or CAPTCHAs.",
+          requiresFbrAction: true,
+        },
+        portal_new_return_setup: {
+          title: "Finish opening the new return in FBR",
+          summary: pauseMessage,
+          tone: "amber",
+          badge: "Setup needed",
+          steps: [
+            `Select form 114(1) and period TY${taxYear} in the FBR window and answer the opening questions.`,
+            "Choose Continue below once the return opens (do not submit).",
+          ],
+          safetyNote: "No values were entered, saved, or submitted.",
+          requiresFbrAction: true,
+        },
+        session_reconnect: {
+          title: "Sign in to FBR IRIS to continue",
+          summary: pauseMessage,
+          tone: "amber",
+          badge: "Sign-in needed",
+          steps: [
+            "Log in to FBR IRIS in the open desktop window (including CAPTCHA/OTP if asked).",
+            "Choose Continue below once your dashboard or return appears.",
+          ],
+          safetyNote: "Nothing was changed in FBR.",
+          requiresFbrAction: true,
+        },
+        portal_draft_ambiguous: {
+          title: "Multiple matching draft returns found in FBR",
+          summary: pauseMessage,
+          tone: "amber",
+          badge: "Choose return",
+          steps: [
+            `Open the exact TY${taxYear} 114(1) draft return you intend to file in the FBR window.`,
+            "Choose Continue below.",
+          ],
+          safetyNote: "The agent refused to guess between multiple drafts.",
+          requiresFbrAction: true,
+        },
+        portal_draft_list_incomplete: {
+          title: "Full draft list is not visible in FBR",
+          summary: pauseMessage,
+          tone: "amber",
+          badge: "List incomplete",
+          steps: [
+            "Wait for the draft table in FBR to finish loading or open the intended return yourself.",
+            "Choose Continue below.",
+          ],
+          safetyNote: "No values were entered, saved, or submitted.",
+          requiresFbrAction: true,
+        },
+        portal_unsupported_route: {
+          title: "Unsupported FBR return form",
+          summary: pauseMessage,
+          tone: "red",
+          badge: "Unsupported form",
+          steps: [
+            "Cancel this run below and review your return type in TaxRocket.",
+          ],
+          safetyNote: "No return was opened or changed in FBR.",
+          requiresFbrAction: false,
+        },
+      }[navAction] || {
+        title: "FBR return check paused",
+        summary: pauseMessage,
+        tone: "amber",
+        badge: "Action needed",
+        steps: [
+          "Check the open FBR IRIS window and ensure the intended return is visible.",
+          "Choose Continue below to retry the check.",
+        ],
+        safetyNote: "Nothing was entered, saved, or submitted.",
+        requiresFbrAction: true,
+      };
   const result = {
     mode: "live_return_navigation_only",
     requiredAction: outcome.requiredAction,
     message: pauseMessage,
     pauseReason: pauseMessage,
+    ...(navPauseDetails ? { pauseDetails: navPauseDetails } : {}),
     taxYear,
     returnTypeConfirmed: outcome.inspection.frames.some(
       (frame) =>
@@ -4570,8 +4858,6 @@ async function runLocalIrisNavigationCheck(jobContext, job) {
   // was unreachable even when navigation had fully succeeded: both filing flows
   // return early on `navigation?.paused`. Every other requiredAction is still a
   // genuine checkpoint. Save/Submit remain untouched either way.
-  const navigationComplete =
-    outcome.requiredAction === "portal_sections_inspected";
   onStep(
     navigationComplete ? "inspection_complete" : "inspection_pause",
     `Navigation checkpoint: ${outcome.requiredAction}. Local structure file: ${inspectionPath}`,
@@ -4689,18 +4975,54 @@ async function runRealIrisAutofill(jobContext, job, mode) {
     ? irisDividendEntry.getDividendPacketRoute(snapshot) : null;
   if (dividendRoute && !dividendRoute.active) {
     const message = `Dividend packet refused (${dividendRoute.reason}). Regenerate and approve current evidence; nothing was changed in FBR.`;
-    return { paused: true, pauseAction: "portal_state_confirmation", pauseMessage: message, executionLog: [], result: { requiredAction: "portal_state_confirmation", message, submitted: false } };
+    const pauseDetails = {
+      title: "Dividend packet is missing required evidence",
+      summary: message,
+      tone: "red",
+      badge: "Packet check failed",
+      steps: [
+        "Open the Documents & Review steps in TaxRocket and verify your Dividend certificate(s).",
+        "Approve a fresh filing packet, then start FBR filing again.",
+      ],
+      safetyNote: "Nothing was changed, saved, or submitted in FBR.",
+      requiresFbrAction: false,
+    };
+    return { paused: true, pauseAction: "portal_state_confirmation", pauseMessage: message, pauseDetails, executionLog: [], result: { requiredAction: "portal_state_confirmation", message, pauseDetails, submitted: false } };
   }
 
   const bankProfitRoute = servicesRoute.incomeSources.includes("bank_profit") || snapshot?.otherSources?.bankProfit
     ? irisBankProfitEntry.getBankProfitPacketRoute(snapshot) : null;
   if (bankProfitRoute && !bankProfitRoute.active) {
     const message = `Bank Profit packet refused (${bankProfitRoute.reason}). Regenerate and approve current evidence; nothing was changed in FBR.`;
-    return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage:message,executionLog:[],result:{requiredAction:"portal_state_confirmation",message,submitted:false}};
+    const pauseDetails = {
+      title: "Bank Profit packet is missing required evidence",
+      summary: message,
+      tone: "red",
+      badge: "Packet check failed",
+      steps: [
+        "Open the Documents & Review steps in TaxRocket and verify your Bank Profit certificate(s).",
+        "Approve a fresh filing packet, then start FBR filing again.",
+      ],
+      safetyNote: "Nothing was changed, saved, or submitted in FBR.",
+      requiresFbrAction: false,
+    };
+    return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage:message,pauseDetails,executionLog:[],result:{requiredAction:"portal_state_confirmation",message,pauseDetails,submitted:false}};
   }
   if (bankProfitRoute?.active && (snapshot.business || snapshot.services || snapshot.pension || snapshot.computations || snapshot.otherSources?.taxDeductions || snapshot.portalFieldMapDetailed?.employers?.length || (snapshot.portalFieldMap && !Array.isArray(snapshot.portalFieldMap) && (snapshot.portalFieldMap.incomeFields?.length || snapshot.portalFieldMap.adjustableTaxFields?.length || snapshot.portalFieldMap.businessFields?.length || snapshot.portalFieldMap.employers?.length)) || (Array.isArray(snapshot.portalFieldMap) ? snapshot.portalFieldMap.some(field=>field.sourceGroup!=="wealthFields") : false))) {
     const message="Bank Profit dedicated-only packet contains unexpected schedules. Regenerate the approved packet; nothing was changed in FBR.";
-    return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage:message,executionLog:[],result:{message,submitted:false}};
+    const pauseDetails = {
+      title: "Bank Profit packet includes unsupported extra schedules",
+      summary: message,
+      tone: "red",
+      badge: "Packet check failed",
+      steps: [
+        "Regenerate and approve a fresh Bank Profit packet in TaxRocket.",
+        "Start FBR filing again once approved.",
+      ],
+      safetyNote: "Nothing was changed, saved, or submitted in FBR.",
+      requiresFbrAction: false,
+    };
+    return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage:message,pauseDetails,executionLog:[],result:{message,pauseDetails,submitted:false}};
   }
 
   const servicesRouteActive = servicesRoute.active;
@@ -4896,9 +5218,17 @@ async function runRealIrisAutofill(jobContext, job, mode) {
         )
         .join(", ")}). ${
         getWealthAutofillEnabled()
-          ? servicesRouteActive
-            ? "The wealth driver will handle them after the Services figures."
-            : "The wealth driver will handle them after Salary."
+          ? bankProfitRoute?.active
+            ? "The wealth driver will handle them after Bank Profit."
+            : dividendRoute?.active
+              ? "The wealth driver will handle them after Dividend."
+              : servicesRouteActive
+                ? "The wealth driver will handle them after the Services figures."
+                : Array.isArray(snapshot?.filing?.incomeSources) &&
+                    snapshot.filing.incomeSources.length === 1 &&
+                    snapshot.filing.incomeSources[0] === "pension"
+                  ? "The wealth driver will handle them after Pension."
+                  : "The wealth driver will handle them after Salary."
           : "TAXROCKET_WEALTH_AUTOFILL is off, so they are NOT entered."
       }`,
     );
@@ -4949,15 +5279,30 @@ async function runRealIrisAutofill(jobContext, job, mode) {
           `nothing was filled and no section tour was attempted.`,
   );
   if (!workspace?.returnWorkspace) {
+    const pauseMessage =
+      "The agent could not prove the return is open, so it held instead of filling.";
+    const pauseDetails = {
+      title: "Open your FBR draft return to continue",
+      summary: pauseMessage,
+      tone: "amber",
+      badge: "Return not open",
+      steps: [
+        "In the open FBR window, click into the draft 114(1) return so the form tabs and tax year header are visible.",
+        "Choose Continue below once the return workspace is open.",
+      ],
+      safetyNote: "Nothing was entered, saved, or submitted.",
+      requiresFbrAction: true,
+    };
     return {
       paused: true,
       pauseAction: "portal_state_confirmation",
-      pauseMessage:
-        "The agent could not prove the return is open, so it held instead of filling.",
+      pauseMessage,
+      pauseDetails,
       executionLog,
       result: {
         mode,
         workspace,
+        pauseDetails,
         summary: { total: coded.length, filled: 0, skipped: 0, byStatus: {} },
         results: [],
       },
@@ -4989,9 +5334,55 @@ async function runRealIrisAutofill(jobContext, job, mode) {
     }
     onStep("dividend_existing_income_check", existingIncomeCheck.reason);
     if (!existingIncomeCheck.ok) {
-      const details = existingIncomeCheck.conflicts.map(row => `${row.description} [${row.code}]: gross ${row.gross.toLocaleString("en-US")}, tax deducted ${row.tax.toLocaleString("en-US")} — ${row.reason}.`).join(" ");
-      const message = `${existingIncomeCheck.reason} ${details} No amounts were entered by this autofill run. Existing entries were not changed or deleted. Review the source records and align the supported filing before trying again; do not delete genuine income or add balancing amounts. Bank Profit + Dividend is not enabled by this check.`;
-      return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage:message,executionLog,result:{mode,summary:{total:0,filled:0,skipped:0,byStatus:{}},results:[],existingIncomeCheck,reviewRequired:true,message,submitted:false}};
+      const fmtPkr = (value) => Number(value || 0).toLocaleString("en-US");
+      const packetByCode = new Map();
+      for (const field of dividendRoute.agentFields || []) {
+        const g = Number(field.values?.find((v) => v.columnIndex === 0)?.value || 0);
+        const t = Number(field.values?.find((v) => v.columnIndex === 1)?.value || 0);
+        const prev = packetByCode.get(field.irisCode) || { label: field.label, gross: 0, tax: 0 };
+        prev.gross += g;
+        prev.tax += t;
+        packetByCode.set(field.irisCode, prev);
+      }
+      const pauseRows = existingIncomeCheck.conflicts.map((row) => {
+        const pkt = packetByCode.get(String(row.code));
+        return {
+          code: String(row.code),
+          label: String(row.description || row.code),
+          status: /not part of/i.test(row.reason || "") ? "missing_in_packet" : "differs",
+          irisValue: `Gross: PKR ${fmtPkr(row.gross)} | Tax Deducted: PKR ${fmtPkr(row.tax)}`,
+          packetValue: pkt
+            ? `Gross: PKR ${fmtPkr(pkt.gross)} | Tax Deducted: PKR ${fmtPkr(pkt.tax)}`
+            : "Not in approved packet",
+        };
+      });
+      const detailLines = pauseRows.map(
+        (r) => `• [${r.code}] ${r.label}\n  - In FBR IRIS: ${r.irisValue}\n  - In TaxRocket Packet: ${r.packetValue}`,
+      );
+      const pauseDetails = {
+        title: "Existing FBR IRIS Dividend figures differ from your packet",
+        summary: existingIncomeCheck.reason,
+        tone: "amber",
+        badge: "Differs from packet",
+        rows: pauseRows,
+        steps: [
+          "Compare the FBR IRIS figures above against your Dividend certificate(s).",
+          "Update and approve the matching Dividend evidence in TaxRocket (never delete genuine income or invent balancing numbers).",
+          "Cancel this paused run below and start a fresh FBR autofill once aligned.",
+        ],
+        safetyNote: "No amounts were entered, changed, deleted, saved, or submitted in FBR IRIS.",
+        requiresFbrAction: false,
+      };
+      const message = [
+        existingIncomeCheck.reason,
+        ...(detailLines.length ? ["", "Comparison (FBR IRIS vs. TaxRocket Packet):", ...detailLines] : []),
+        "",
+        "What to do:",
+        ...pauseDetails.steps.map((s, idx) => `${idx + 1}. ${s}`),
+        "",
+        pauseDetails.safetyNote,
+      ].join("\n");
+      return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage:message,executionLog,result:{mode,routeScope:handoffRoute,summary:{total:0,filled:0,skipped:0,byStatus:{}},results:[],existingIncomeCheck,pauseDetails,reviewRequired:true,message,submitted:false}};
     }
   }
 
@@ -5000,22 +5391,114 @@ async function runRealIrisAutofill(jobContext, job, mode) {
   // saved in IRIS, so a mismatch pauses and changes nothing.
   if (bankProfitRoute?.active) {
     let bankExistingCheck;
+    let bankExistingBefore = null;
     try {
-      const before = await irisTourCensus.runCensusTour(windowInstance, {
+      bankExistingBefore = await irisTourCensus.runCensusTour(windowInstance, {
         label: "bank profit existing income (before any entry)",
         onlyViews: [irisBankProfitExistingIncome.VIEW],
         onStep,
         beforeStep: () => ensureNavigationJobActive(job.id, String(taxpayerIdentifier).trim().replace(/[ -]/g, "")),
       });
-      bankExistingCheck = irisBankProfitExistingIncome.checkExistingBankProfitIncome(before, bankProfitRoute);
+      bankExistingCheck = irisBankProfitExistingIncome.checkExistingBankProfitIncome(bankExistingBefore, bankProfitRoute);
     } catch (error) {
       bankExistingCheck = {ok:false,reason:"Existing IRIS income could not be checked safely. No values will be entered.",conflicts:[]};
     }
     onStep("bank_profit_existing_income_check", bankExistingCheck.reason);
     if (!bankExistingCheck.ok) {
-      const details = bankExistingCheck.conflicts.map(row => `${row.description} [${row.code}]: gross ${Number(row.gross).toLocaleString("en-US")}, tax deducted ${Number(row.tax).toLocaleString("en-US")} — ${row.reason}.`).join(" ");
-      const message = `${bankExistingCheck.reason} ${details} No amounts were entered by this autofill run. Existing entries were not changed or deleted. Review the source records and align the supported filing before trying again; do not delete genuine income or add balancing amounts. Dividend + Bank Profit combined entry is not enabled by this check.`;
-      return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage:message,executionLog,result:{mode,summary:{total:0,filled:0,skipped:0,byStatus:{}},results:[],bankExistingCheck,reviewRequired:true,message,submitted:false}};
+      const fmtPkr = (value) => Number(value || 0).toLocaleString("en-US");
+      const parseIrisNum = (raw) => {
+        if (raw === null || raw === undefined) return 0;
+        const n = Number(String(raw).replace(/,/g, "").replace(/\s+/g, "").trim());
+        return Number.isFinite(n) ? n : 0;
+      };
+      const beforeView = (bankExistingBefore?.views || []).find(
+        (v) => String(v?.key || v?.view || "").trim() === irisBankProfitExistingIncome.VIEW,
+      );
+      const irisByCode = new Map();
+      for (const field of beforeView?.rows || []) {
+        const fCode = String(field?.code || "").trim();
+        if (!fCode) continue;
+        const list = irisByCode.get(fCode) || [];
+        const vals = Array.isArray(field.cells) ? field.cells : [];
+        list.push({
+          description: String(field.description || "").replace(/\s+/g, " ").trim(),
+          gross: parseIrisNum(vals[0]?.value),
+          tax: parseIrisNum(vals[1]?.value),
+        });
+        irisByCode.set(fCode, list);
+      }
+      const packetByCode = new Map();
+      for (const row of bankProfitRoute.rows || []) {
+        const g = Number(row.values?.find((v) => v.columnIndex === 0)?.value || 0);
+        const t = Number(row.values?.find((v) => v.columnIndex === 1)?.value || 0);
+        const prev = packetByCode.get(String(row.irisCode)) || { label: row.label, gross: 0, tax: 0 };
+        prev.gross += g;
+        prev.tax += t;
+        packetByCode.set(String(row.irisCode), prev);
+      }
+      const conflictCodes = new Set();
+      const pauseRows = bankExistingCheck.conflicts.map((row) => {
+        conflictCodes.add(String(row.code));
+        const pkt = packetByCode.get(String(row.code));
+        return {
+          code: String(row.code),
+          label: String(row.description || row.code),
+          status: /not part of|not included/i.test(row.reason || "") ? "missing_in_packet" : "differs",
+          irisValue: `Gross: PKR ${fmtPkr(row.gross)} | Tax Deducted: PKR ${fmtPkr(row.tax)}`,
+          packetValue: pkt
+            ? `Gross: PKR ${fmtPkr(pkt.gross)} | Tax Deducted: PKR ${fmtPkr(pkt.tax)}`
+            : "Not in approved packet",
+        };
+      });
+      for (const [code, pkt] of packetByCode.entries()) {
+        if (conflictCodes.has(code)) continue;
+        const rowsForCode = irisByCode.get(code) || [];
+        const baseNorm = String(pkt.label || "").replace(/\s+/g, " ").trim().toLowerCase();
+        const summaryRows = rowsForCode.filter((r) => {
+          const d = r.description.toLowerCase();
+          return !/--/.test(r.description) && !d.startsWith(`${baseNorm} -`) && !d.startsWith(`${baseNorm}-`);
+        });
+        const sourceRows = summaryRows.length ? summaryRows : rowsForCode;
+        const irisGross = sourceRows.reduce((s, r) => s + r.gross, 0);
+        const irisTax = sourceRows.reduce((s, r) => s + r.tax, 0);
+        const hasAnyIris = sourceRows.some((r) => r.gross !== 0 || r.tax !== 0);
+        pauseRows.push({
+          code,
+          label: pkt.label,
+          status: hasAnyIris ? "needs_review" : "missing_in_iris",
+          irisValue: hasAnyIris
+            ? `Gross: PKR ${fmtPkr(irisGross)} | Tax Deducted: PKR ${fmtPkr(irisTax)}`
+            : "Empty (PKR 0)",
+          packetValue: `Gross: PKR ${fmtPkr(pkt.gross)} | Tax Deducted: PKR ${fmtPkr(pkt.tax)}`,
+        });
+      }
+      const detailLines = pauseRows.map(
+        (r) => `• [${r.code}] ${r.label}\n  - In FBR IRIS: ${r.irisValue}\n  - In TaxRocket Packet: ${r.packetValue}`,
+      );
+      const pauseDetails = {
+        title: "Existing FBR IRIS Bank Profit figures differ from your packet",
+        summary: bankExistingCheck.reason,
+        tone: "amber",
+        badge: "Differs from packet",
+        rows: pauseRows,
+        steps: [
+          "Compare the FBR IRIS figures above with your actual bank profit certificates (FBR auto-fills bank u/s 165 withholding even in a fresh return).",
+          "Update and approve matching certificates in TaxRocket (never delete genuine income or invent balancing numbers).",
+          "Cancel this paused run below and start a fresh FBR autofill once your records align.",
+        ],
+        safetyNote: "No amounts were entered, changed, deleted, saved, or submitted in FBR IRIS.",
+        requiresFbrAction: false,
+      };
+      const message = [
+        bankExistingCheck.reason,
+        ...(detailLines.length ? ["", "Comparison (FBR IRIS vs. TaxRocket Packet):", ...detailLines] : []),
+        "",
+        "What to do:",
+        ...pauseDetails.steps.map((s, idx) => `${idx + 1}. ${s}`),
+        "",
+        pauseDetails.safetyNote,
+      ].join("\n");
+      return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage:message,executionLog,result:{mode,routeScope:handoffRoute,summary:{total:0,filled:0,skipped:0,byStatus:{}},results:[],bankExistingCheck,pauseDetails,reviewRequired:true,message,submitted:false}};
     }
   }
 
@@ -5024,7 +5507,19 @@ async function runRealIrisAutofill(jobContext, job, mode) {
   if (snapshot.business?.version === "business-entry-v9") {
     if (!snapshot.businessBankOwnershipStamp) {
       const pauseMessage = "Business bank review stamp is missing. Regenerate and approve the packet; nothing was entered.";
-      return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage,executionLog,result:{mode,summary:{total:0,filled:0,skipped:0,byStatus:{}},results:[],reviewRequired:true,message:pauseMessage}};
+      const pauseDetails = {
+        title: "Business bank review stamp missing",
+        summary: pauseMessage,
+        tone: "red",
+        badge: "Packet check failed",
+        steps: [
+          "Review your Business and Personal bank accounts in TaxRocket and approve a fresh packet.",
+          "Start FBR filing again once approved.",
+        ],
+        safetyNote: "Nothing was entered, saved, or submitted in FBR.",
+        requiresFbrAction: false,
+      };
+      return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage,pauseDetails,executionLog,result:{mode,summary:{total:0,filled:0,skipped:0,byStatus:{}},results:[],pauseDetails,reviewRequired:true,message:pauseMessage}};
     }
     const personalIbans = wealthPrepared.filter(f => String(f.irisCode) === "7030").map(f => f.rowDescriptionIncludes);
     const businessIbans = (snapshot.business?.balanceDetails?.agentFields ?? []).filter(f => f.kind === "bank" && String(f.irisCode) === "3320").map(f => f.iban);
@@ -5035,8 +5530,20 @@ async function runRealIrisAutofill(jobContext, job, mode) {
     });
     if (!crossCheck.ok) {
       const pauseMessage = crossCheck.reason;
+      const pauseDetails = {
+        title: "Bank account already exists in the other FBR section",
+        summary: pauseMessage,
+        tone: "amber",
+        badge: "Cross-section conflict",
+        steps: [
+          "Check the IBAN placement in FBR IRIS (Personal Assets vs. Business Capital/Bank) against your TaxRocket filing.",
+          "Align TaxRocket or FBR so each bank account appears in only the right section, then start a fresh run.",
+        ],
+        safetyNote: "Nothing was entered, moved, deleted, saved, or submitted in FBR.",
+        requiresFbrAction: false,
+      };
       onStep("real_autofill_bank_cross_section_hold",pauseMessage);
-      return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage,executionLog,result:{mode,summary:{total:0,filled:0,skipped:0,byStatus:{}},results:[],reviewRequired:true,message:pauseMessage}};
+      return {paused:true,pauseAction:"portal_state_confirmation",pauseMessage,pauseDetails,executionLog,result:{mode,summary:{total:0,filled:0,skipped:0,byStatus:{}},results:[],pauseDetails,reviewRequired:true,message:pauseMessage}};
     }
     onStep("real_autofill_bank_cross_section_checked","Both bank sections checked by IBAN; no opposite-section conflict was found.");
   }
@@ -5158,11 +5665,29 @@ async function runRealIrisAutofill(jobContext, job, mode) {
       `Add the missing employer${employerIssues.length === 1 ? "" : "s"} in FBR under Employment > Salary > Add Employer Details. ` +
       `Then tick the confirmation box and select Continue. ` +
       `No salary or wealth figures were entered. Nothing was saved, submitted, calculated or paid.`;
+    const pauseDetails = {
+      title: "Add employer details in FBR before autofill",
+      summary: `${employerIssues.join(" ")}`,
+      tone: "amber",
+      badge: "Employer needed",
+      rows: (employersPrepared || []).map((name) => ({
+        label: name,
+        irisValue: "Not matched automatically",
+        status: "needs_review",
+      })),
+      steps: [
+        "In the FBR window, open Employment > Salary > Add Employer Details and add the employer(s) above.",
+        "Return here, tick the confirmation box, and click Continue.",
+      ],
+      safetyNote: "No salary or wealth figures were entered. Nothing was saved, submitted, calculated, or paid.",
+      requiresFbrAction: true,
+    };
     onStep("real_autofill_employer_pause", pauseMessage);
     return {
       paused: true,
       pauseAction: getEmployerReviewAction(),
       pauseMessage,
+      pauseDetails,
       executionLog,
       result: {
         mode,
@@ -5170,6 +5695,7 @@ async function runRealIrisAutofill(jobContext, job, mode) {
         salarySummary: { total: 0, filled: 0, skipped: 0, byStatus: {} },
         results: [],
         message: pauseMessage,
+        pauseDetails,
         wealthPrepared: wealthPrepared.map((f) => ({
           irisCode: f.irisCode,
           label: f.label,
@@ -5823,6 +6349,25 @@ async function runRealIrisAutofill(jobContext, job, mode) {
     : null;
 
 
+  const bankProfitOptions = bankProfitRoute?.active ? {
+    mode:"live",onStep,
+    beforeStep:()=>ensureNavigationJobActive(job.id,String(taxpayerIdentifier||"").trim().replace(/[ -]/g,"")),
+    verifyDocument:async()=>{
+      const inspection=await irisNavigation.probeFrames(windowInstance,{taxYear,taxpayerIdentifier,openReturn:true});
+      const documents=(inspection.frames||[]).filter(frame=>frame.document?.present);
+      const document=documents.length===1?documents[0].document:null;
+      return {ok:Boolean(document&&document.taxYear===Number(taxYear)&&document.originalFullYear&&document.identityStatus==="match")};
+    },
+    ensureSection:()=>irisNavigation.navigateToSection(windowInstance,{sectionId:"other_sources_tax_deductions",taxYear,taxpayerIdentifier,beforeStep:()=>ensureNavigationJobActive(job.id,String(taxpayerIdentifier||"").trim().replace(/[ -]/g,"")),onStep}),
+  } : null;
+  let bankProfitOutcome = null;
+  if(bankProfitRoute?.active && mode==="live" && !stopped){
+    bankProfitOutcome=await irisBankProfitEntry.fillBankProfitEntries(windowInstance,bankProfitRoute,bankProfitOptions);
+    results=results.concat(bankProfitOutcome.results||[]);
+    if(!bankProfitOutcome.ok)stopped=true;
+    onStep("bank_profit_entry",bankProfitOutcome.ok?"Bank Profit exact-detail gross and withholding verified; derived Tax Chargeable was read only.":`Bank Profit held: ${bankProfitOutcome.reason}.`);
+  }
+
   // Wealth Statement. Opt-in (TAXROCKET_WEALTH_AUTOFILL). The driver opens the
   // Reconciliation / Personal Assets sections itself, creates the rows through
   // the IRIS modals (live) or only reports what it would create (dry), and
@@ -6084,24 +6629,6 @@ async function runRealIrisAutofill(jobContext, job, mode) {
       );
       results = results.concat(taxDeductionOutcome.results || []);
     }
-  }
-  const bankProfitOptions = bankProfitRoute?.active ? {
-    mode:"live",onStep,
-    beforeStep:()=>ensureNavigationJobActive(job.id,String(taxpayerIdentifier||"").trim().replace(/[ -]/g,"")),
-    verifyDocument:async()=>{
-      const inspection=await irisNavigation.probeFrames(windowInstance,{taxYear,taxpayerIdentifier,openReturn:true});
-      const documents=(inspection.frames||[]).filter(frame=>frame.document?.present);
-      const document=documents.length===1?documents[0].document:null;
-      return {ok:Boolean(document&&document.taxYear===Number(taxYear)&&document.originalFullYear&&document.identityStatus==="match")};
-    },
-    ensureSection:()=>irisNavigation.navigateToSection(windowInstance,{sectionId:"other_sources_tax_deductions",taxYear,taxpayerIdentifier,beforeStep:()=>ensureNavigationJobActive(job.id,String(taxpayerIdentifier||"").trim().replace(/[ -]/g,"")),onStep}),
-  } : null;
-  let bankProfitOutcome = null;
-  if(bankProfitRoute?.active && mode==="live" && !stopped){
-    bankProfitOutcome=await irisBankProfitEntry.fillBankProfitEntries(windowInstance,bankProfitRoute,bankProfitOptions);
-    results=results.concat(bankProfitOutcome.results||[]);
-    if(!bankProfitOutcome.ok)stopped=true;
-    onStep("bank_profit_entry",bankProfitOutcome.ok?"Bank Profit exact-detail gross and withholding verified; derived Tax Chargeable was read only.":`Bank Profit held: ${bankProfitOutcome.reason}.`);
   }
   // Dividend lives outside the generic section-tour field surface: its Final
   // Tax rows do not exist until the exact picker adds them. No Employment,
@@ -6767,9 +7294,9 @@ async function runRealIrisAutofill(jobContext, job, mode) {
     irisTotals={...irisTotals,"7033":otherSourcesWealthProof.totals["7033"],"703000":otherSourcesWealthProof.totals["703000"]};
     onStep("other_sources_wealth_provenance",otherSourcesWealthProof.reason);
   }
-  const bankProfitWealthCheck = mode==="live" && bankProfitRoute?.active
+  const bankProfitWealthCheck = mode==="live" && bankProfitRoute?.active && !stopped
     ? irisBankProfitEntry.checkBankProfitWealth(bankProfitRoute,irisTotals,irisTourCensus.parseIrisAmount) : null;
-  const dividendWealthCheck = mode === "live" && dividendRoute?.active
+  const dividendWealthCheck = mode === "live" && dividendRoute?.active && !stopped
     ? irisDividendEntry.checkDividendWealth(dividendRoute, irisTotals, irisTourCensus.parseIrisAmount)
     : null;
   if (dividendWealthCheck) onStep("dividend_wealth_readback", dividendWealthCheck.reason);
@@ -6806,7 +7333,7 @@ async function runRealIrisAutofill(jobContext, job, mode) {
   let censusAfterSave = null;
   let afterSaveChecks = [];
   const previousReturnRouteEntry = bankProfitRoute?.active ? irisBankProfitEntry : dividendRoute?.active ? irisDividendEntry : null;
-  const otherSourcesPreviousReturn = previousReturnRouteEntry ? previousReturnRouteEntry.checkPreviousReturn(snapshot,censusEnd,irisTourCensus.parseIrisAmount) : null;
+  const otherSourcesPreviousReturn = !stopped && previousReturnRouteEntry ? previousReturnRouteEntry.checkPreviousReturn(snapshot,censusEnd,irisTourCensus.parseIrisAmount) : null;
   const wealthReviewRequired =
     mode === "live" && Boolean((otherSourcesPreviousReturn && !otherSourcesPreviousReturn.ok) || wealthReconciliationCheck?.status === "gap" || (dividendWealthCheck && !dividendWealthCheck.ok) || (bankProfitWealthCheck && !bankProfitWealthCheck.ok));
   if (mode === "live") {
@@ -7269,8 +7796,38 @@ async function runRealIrisAutofill(jobContext, job, mode) {
   const otherProblems = results.filter(
     (r) => !isEntered(r.status) && !lockedBusiness.includes(r),
   ).length;
+  const bankProfitEntryFailed = Boolean(
+    mode === "live" && bankProfitRoute?.active && bankProfitOutcome && !bankProfitOutcome.ok,
+  );
+  const describeBankProfitFailure = (code) => {
+    const raw = String(code || "bank_profit_entry_stopped");
+    if (raw === "existing_value_conflict") {
+      return "An existing non-zero Bank Profit cell in FBR IRIS conflicts with your TaxRocket packet.";
+    }
+    if (raw === "row_layout_unverified" || raw === "approved_detail_not_unique_or_mismatched") {
+      return "The Final Tax row shape in FBR IRIS did not match the approved certificate layout cleanly.";
+    }
+    if (raw === "bank_profit_derived_chargeable_unverified") {
+      return "IRIS did not calculate or match the expected derived Tax Chargeable (col 3) after filling Taxable Amount and Tax Deducted.";
+    }
+    if (raw === "bank_profit_navigation_unverified" || raw === "bank_profit_frame_not_unique") {
+      return "Other Sources > Tax Deductions could not be opened or verified uniquely in the FBR window.";
+    }
+    if (raw === "final_tax_grid_unverified" || raw === "final_tax_panel_not_unique" || raw === "final_tax_headers_mismatch") {
+      return "The Final Tax grid in Other Sources > Tax Deductions did not match the expected 3-column IRIS layout.";
+    }
+    if (/dialog/i.test(raw)) {
+      return `An IRIS popup dialog interfered with Bank Profit entry (${raw}).`;
+    }
+    return `Bank Profit entry stopped safely (${raw}).`;
+  };
+  const bankProfitFailureSummary = bankProfitEntryFailed
+    ? describeBankProfitFailure(bankProfitOutcome.reason)
+    : "";
   const pauseMessage = businessDetailsPending
     ? `Numeric fields: ${summary.filled}/${summary.total} verified. Business Details is NOT verified (${businessDetailsAfterSave?.reason || businessDetailsReadback?.reason || businessDetailsOutcome?.reason || "not reached"}). Check the Business Details tab, then Retry automatic filing. The agent never edits an existing business.${saveNote} ${nothingDone}`
+    : bankProfitEntryFailed
+      ? `${bankProfitFailureSummary} (code: ${bankProfitOutcome.reason || "unknown"}). Check Other Sources > Tax Deductions > Final Tax in the FBR window, ensure your packet matches your certificates, and start a fresh run.${saveNote} ${nothingDone}`
     : wealthReviewRequired
       ? `${summary.filled}/${summary.total} approved field(s) were entered and read back, but the return is not complete: ${otherSourcesPreviousReturn && !otherSourcesPreviousReturn.ok ? otherSourcesPreviousReturn.reason : bankProfitWealthCheck && !bankProfitWealthCheck.ok ? bankProfitWealthCheck.reason : dividendWealthCheck && !dividendWealthCheck.ok ? dividendWealthCheck.reason : wealthReconciliationCheck.message} Draft Save was not pressed. After correcting the evidenced rows, press Save yourself in FBR and confirm 703000 becomes 0. Numeric-field completion is not Wealth reconciliation or submission readiness. ${nothingDone}`
     : previousReturnCompletionPending
@@ -7320,6 +7877,198 @@ async function runRealIrisAutofill(jobContext, job, mode) {
   const summariseCensus = (tour) =>
     typeof irisTourCensus !== "undefined" ? irisTourCensus.summariseTour(tour) : null;
 
+  const pauseDetails = !autofillReviewRequired
+    ? null
+    : businessDetailsPending
+      ? {
+          title: "Business Details could not be verified",
+          summary: `Numeric fields verified (${summary.filled}/${summary.total}), but Business Details is not verified (${businessDetailsAfterSave?.reason || businessDetailsReadback?.reason || businessDetailsOutcome?.reason || "not reached"}).`,
+          tone: "amber",
+          badge: "Verification pending",
+          rows: [
+            {
+              label: "Numeric fields",
+              packetValue: `${summary.filled}/${summary.total} verified`,
+              status: "needs_review",
+            },
+            {
+              label: "Business Details tab",
+              irisValue: businessDetailsAfterSave?.reason || businessDetailsReadback?.reason || businessDetailsOutcome?.reason || "Not verified",
+              status: "needs_review",
+            },
+          ],
+          steps: [
+            "Open the Business Details tab in the FBR window and verify your business name, principal activity, and dates.",
+            "Click Retry automatic filing below. The agent never edits an existing business.",
+          ],
+          safetyNote: `${saveNote.trim() || nothingDone}`,
+          requiresFbrAction: true,
+        }
+      : bankProfitEntryFailed
+        ? {
+            title: "Bank Profit entry paused before saving",
+            summary: `${bankProfitFailureSummary} (${bankProfitOutcome.reason || "stopped"})`,
+            tone: "amber",
+            badge: "Needs review",
+            rows: (bankProfitRoute?.rows || []).map((row) => {
+              const rowResults = results.filter(
+                (entry) => entry.bankProfitDocumentId === row.documentId && String(entry.irisCode) === String(row.irisCode),
+              );
+              const rowVerified =
+                rowResults.length >= 2 && rowResults.every((entry) => isEntered(entry.status));
+              const fmtPkr = (v) => Number(v || 0).toLocaleString("en-US");
+              const gross = row.values?.find((v) => v.columnIndex === 0)?.value || 0;
+              const tax = row.values?.find((v) => v.columnIndex === 1)?.value || 0;
+              const chargeable = row.taxChargeable?.expected ?? 0;
+              return {
+                code: String(row.irisCode),
+                label: row.investment ? `${row.label} — ${row.investment}` : String(row.label),
+                irisValue: rowVerified
+                  ? "Entered & verified in FBR IRIS"
+                  : `Stopped (${bankProfitOutcome.reason || "needs review"})`,
+                packetValue: `Gross: PKR ${fmtPkr(gross)} | Tax Deducted: PKR ${fmtPkr(tax)} | Chargeable: PKR ${fmtPkr(chargeable)}`,
+                status: bankProfitOutcome.reason === "existing_value_conflict" && !rowVerified ? "differs" : "needs_review",
+              };
+            }),
+            steps: [
+              "Inspect Other Sources > Tax Deductions > Final Tax in the FBR window (close any open popup and check existing or calculated values).",
+              "Once your FBR draft and TaxRocket Bank Profit packet align, cancel this paused run and start a fresh autofill.",
+            ],
+            safetyNote: "Draft Save was not pressed. Nothing was submitted or paid.",
+            requiresFbrAction: true,
+          }
+      : wealthReviewRequired
+        ? {
+            title: "Wealth totals or reconciliation did not match",
+            summary: otherSourcesPreviousReturn && !otherSourcesPreviousReturn.ok
+              ? otherSourcesPreviousReturn.reason
+              : bankProfitWealthCheck && !bankProfitWealthCheck.ok
+                ? bankProfitWealthCheck.reason
+                : dividendWealthCheck && !dividendWealthCheck.ok
+                  ? dividendWealthCheck.reason
+                  : wealthReconciliationCheck.message,
+            tone: "amber",
+            badge: "Reconciliation review",
+            rows: [
+              ...(bankProfitWealthCheck && !bankProfitWealthCheck.ok
+                ? [
+                    {
+                      code: "7033",
+                      label: "Income Attributable to Final / Fixed Tax",
+                      irisValue: bankProfitWealthCheck.finalTaxIncome === null ? "Not seen" : `PKR ${Number(bankProfitWealthCheck.finalTaxIncome).toLocaleString("en-US")}`,
+                      packetValue: `PKR ${Number(bankProfitRoute?.wealth?.finalTaxIncome?.expected || 0).toLocaleString("en-US")}`,
+                      status: "differs",
+                    },
+                    {
+                      code: "703000",
+                      label: "Unreconciled Amount",
+                      irisValue: bankProfitWealthCheck.unreconciled === null ? "Not seen" : `PKR ${Number(bankProfitWealthCheck.unreconciled).toLocaleString("en-US")}`,
+                      packetValue: "PKR 0",
+                      status: "differs",
+                    },
+                  ]
+                : []),
+              ...(wealthReconciliationCheck?.status === "gap"
+                ? [
+                    {
+                      code: "703000",
+                      label: "Unreconciled Amount",
+                      irisValue: `PKR ${Number(wealthReconciliationCheck.unreconciled || 0).toLocaleString("en-US")}`,
+                      packetValue: "PKR 0",
+                      status: "differs",
+                    },
+                  ]
+                : []),
+            ],
+            steps: [
+              "Review your existing income, tax, and Wealth Statement rows in FBR IRIS.",
+              "Correct any missing or mismatched evidenced figures (never add a balancing plug), then press Save yourself in FBR and confirm 703000 becomes 0.",
+            ],
+            safetyNote: "Draft Save was not pressed. Nothing was submitted or paid.",
+            requiresFbrAction: true,
+          }
+        : previousReturnCompletionPending || bankProfitCompletionPending || dividendCompletionPending
+          ? {
+              title: "Post-Save verification did not complete",
+              summary: previousReturnCompletionPending
+                ? otherSourcesPreviousReturnAfterSave.reason
+                : bankProfitCompletionPending
+                  ? bankProfitCompletionCheck.reason
+                  : dividendCompletionCheck.reason,
+              tone: "amber",
+              badge: "Needs verification",
+              rows: [],
+              steps: [
+                "Check the figures and Wealth reconciliation (row 703000 = 0) in FBR IRIS.",
+                "Press Save in FBR once everything matches, or cancel and start a fresh run.",
+              ],
+              safetyNote: `${saveNote.trim() || nothingDone}`,
+              requiresFbrAction: true,
+            }
+          : businessRetryRequired
+            ? {
+                title: `${lockedBusiness.length} business figure(s) stayed locked in IRIS`,
+                summary: `IRIS kept ${lockedBusiness.length} control(s) read-only or unverified after waiting${waitedSeconds ? ` (${waitedSeconds}s)` : ""}.`,
+                tone: "amber",
+                badge: "Retry available",
+                rows: lockedBusiness.map((r) => ({
+                  code: String(r.irisCode),
+                  label: String(r.label || r.sectionId || r.irisCode),
+                  irisValue: r.sectionStatus || "Locked / read-only",
+                  packetValue: r.plannedValue ? `PKR ${Number(String(r.plannedValue).replace(/,/g, "")).toLocaleString("en-US")}` : undefined,
+                  status: "needs_review",
+                })),
+                steps: [
+                  "Wait a few seconds for IRIS to finish loading or calculating in the FBR window.",
+                  "Press Retry automatic filing below (no manual entry or confirmation checkbox is needed).",
+                ],
+                safetyNote: "Locked controls are never bypassed. Nothing was saved, submitted, or paid.",
+                requiresFbrAction: false,
+              }
+            : expenseRetryRequired
+              ? {
+                  title: "Personal expense row was not ready in IRIS",
+                  summary: "A pop-up or slow IRIS load blocked entering a supported personal-expense row.",
+                  tone: "amber",
+                  badge: "Retry available",
+                  rows: failedEntries.map((entry) => ({
+                    code: String(entry.irisCode),
+                    label: String(entry.label || entry.irisCode),
+                    packetValue: entry.plannedValue ? `PKR ${Number(String(entry.plannedValue).replace(/,/g, "")).toLocaleString("en-US")}` : undefined,
+                    status: "needs_review",
+                  })),
+                steps: [
+                  "Close any open pop-up in the FBR window and let IRIS finish loading.",
+                  "Press Retry automatic filing below.",
+                ],
+                safetyNote: "Nothing was saved, submitted, calculated, or paid.",
+                requiresFbrAction: false,
+              }
+            : attention.itemCount > 0
+              ? null
+              : {
+                  title: "Some approved figures could not be placed automatically",
+                  summary: `The FBR return opened, but ${summary.skipped} approved field(s) could not be placed safely (${fillMessage}).`,
+                  tone: "amber",
+                  badge: "Review needed",
+                  rows: results
+                    .filter((r) => !isEntered(r.status))
+                    .slice(0, 12)
+                    .map((r) => ({
+                      code: String(r.irisCode || ""),
+                      label: String(r.label || r.rowDescription || r.irisCode || "Field"),
+                      irisValue: r.existingValue ? `PKR ${r.existingValue}` : String(r.status || "Skipped"),
+                      packetValue: r.plannedValue ? `PKR ${r.plannedValue}` : undefined,
+                      status: "needs_review",
+                    })),
+                  steps: [
+                    "Review those fields in the FBR window.",
+                    "Confirm or enter them in FBR, then tick the confirmation and choose Continue.",
+                  ],
+                  safetyNote: `${saveNote.trim() || nothingDone}`,
+                  requiresFbrAction: true,
+                };
+
   return {
     paused: autofillReviewRequired,
     pauseAction: businessRetryRequired
@@ -7330,11 +8079,13 @@ async function runRealIrisAutofill(jobContext, job, mode) {
           ? "portal_autofill_review"
           : null,
     pauseMessage,
+    pauseDetails,
     executionLog,
     result: {
       mode,
       summary,
       routeScope: handoffRoute,
+      ...(pauseDetails ? { pauseDetails } : {}),
       ...(otherSourcesWealthProof ? {otherSourcesWealthProof} : {}),
       ...(bankProfitRoute?.active ? {bankProfit:{outcome:bankProfitOutcome,afterTab:bankProfitAfterTab,afterSave:bankProfitAfterSave,wealth:bankProfitWealthCheck,completion:bankProfitCompletionCheck}} : {}),
       ...(dividendCompletionCheck ? {dividendCompletionCheck} : {}),
@@ -7523,6 +8274,19 @@ async function runRealIrisAutofill(jobContext, job, mode) {
 function markAutofillOff(navigation) {
   const AUTOFILL_OFF_MESSAGE =
     "The desktop agent was started with autofill switched off, so it only looked at the FBR window and typed nothing. Close the agent, start it again with start-live.ps1 (in the electron-connect folder), then choose Continue. Nothing was entered, saved, submitted, calculated, or paid.";
+  const pauseDetails = {
+    title: "Desktop agent is running in view-only mode",
+    summary: "Autofill is switched off in this desktop agent process, so no figures were entered.",
+    tone: "amber",
+    badge: "Autofill off",
+    steps: [
+      "Close the TaxRocket Desktop Agent window.",
+      "Start it again using start-live.ps1 in the electron-connect folder.",
+      "Click Continue below once reconnected.",
+    ],
+    safetyNote: "Nothing was entered, saved, submitted, calculated, or paid.",
+    requiresFbrAction: false,
+  };
   if (
     !navigation ||
     navigation.paused !== false ||
@@ -7543,10 +8307,12 @@ function markAutofillOff(navigation) {
     ...navigation,
     pauseAction: "portal_autofill_off",
     pauseMessage: AUTOFILL_OFF_MESSAGE,
+    pauseDetails,
     result: {
       ...(navigation.result || {}),
       requiredAction: "portal_autofill_off",
       message: AUTOFILL_OFF_MESSAGE,
+      pauseDetails,
       autofillOff: true,
     },
     executionLog,
@@ -7901,12 +8667,61 @@ function buildHandoffScopeSummary(
           ? "confirmed_by_taxpayer"
           : "entered_not_calculated"
         : "needs_review";
-  const genericSalaryText = `Salary ${
-    salaryNeedsReview
+  const isBankProfitRoute =
+    extras.route?.id === "bank_profit" ||
+    Boolean(extras.bankProfit) ||
+    (Array.isArray(extras.route?.incomeSources) &&
+      extras.route.incomeSources.includes("bank_profit"));
+  const isDividendRoute =
+    extras.route?.id === "dividend" ||
+    (Array.isArray(extras.route?.incomeSources) &&
+      extras.route.incomeSources.includes("dividend"));
+  const bankProfitResults = Array.isArray(extras.bankProfit?.outcome?.results)
+    ? extras.bankProfit.outcome.results
+    : null;
+  const bankProfitTotal = bankProfitResults
+    ? bankProfitResults.length
+    : Number(summary?.total) || 0;
+  const bankProfitFilled = bankProfitResults
+    ? bankProfitResults.filter((r) => ["filled", "already_correct"].includes(r.status)).length
+    : Number(summary?.filled) || 0;
+  const bankProfitNeedsReview = Boolean(
+    reviewRequired ||
+      extras.bankProfit?.outcome?.ok === false ||
+      (extras.bankProfit?.completion && !extras.bankProfit.completion.ok) ||
+      (bankProfitTotal > 0 && bankProfitFilled !== bankProfitTotal),
+  );
+  const dividendTotal = Number(summary?.total) || 0;
+  const dividendFilled = Number(summary?.filled) || 0;
+  const dividendNeedsReview = Boolean(
+    reviewRequired || (dividendTotal > 0 && dividendFilled !== dividendTotal),
+  );
+  const genericSourceLabel = isBankProfitRoute
+    ? "Bank Profit"
+    : isDividendRoute
+      ? "Dividend"
+      : "Salary";
+  const genericNeedsReview = isBankProfitRoute
+    ? bankProfitNeedsReview
+    : isDividendRoute
+      ? dividendNeedsReview
+      : salaryNeedsReview;
+  const genericTotal = isBankProfitRoute
+    ? bankProfitTotal
+    : isDividendRoute
+      ? dividendTotal
+      : salaryTotal;
+  const genericFilled = isBankProfitRoute
+    ? bankProfitFilled
+    : isDividendRoute
+      ? dividendFilled
+      : salaryFilled;
+  const genericSalaryText = `${genericSourceLabel} ${
+    genericNeedsReview
       ? "\u26A0\uFE0F needs review"
-      : salaryTaken > 0
+      : !isBankProfitRoute && !isDividendRoute && salaryTaken > 0
         ? "\u2705 completed by the taxpayer in FBR"
-        : salaryTotal > 0 && salaryFilled === salaryTotal
+        : genericTotal > 0 && genericFilled === genericTotal
           ? "\u2705 filled"
           : "\u26A0\uFE0F not entered"
   }`;
@@ -8123,7 +8938,7 @@ function buildHandoffScopeSummary(
             ? "filled"
             : "not_entered"
       : undefined,
-    salary: isServicesAutomation && !salaryIncluded
+    salary: (isServicesAutomation && !salaryIncluded) || isBankProfitRoute || isDividendRoute
       ? "not_applicable"
       : salaryNeedsReview
         ? "needs_review"
@@ -8132,6 +8947,24 @@ function buildHandoffScopeSummary(
           : salaryTotal > 0 && salaryFilled === salaryTotal
             ? "filled"
             : "not_entered",
+    ...(isBankProfitRoute
+      ? {
+          bankProfit: bankProfitNeedsReview
+            ? "needs_review"
+            : bankProfitTotal > 0 && bankProfitFilled === bankProfitTotal
+              ? "filled"
+              : "not_entered",
+        }
+      : {}),
+    ...(isDividendRoute
+      ? {
+          dividend: dividendNeedsReview
+            ? "needs_review"
+            : dividendTotal > 0 && dividendFilled === dividendTotal
+              ? "filled"
+              : "not_entered",
+        }
+      : {}),
     businessDetails: extras.businessDetails || null,
     manualItems,
     manualUnchecked,
@@ -8205,12 +9038,14 @@ function mergeNavigationAutofillOutcome(navigation, autofill, autofillMode) {
     autofillMode,
     autofillSummary: summary,
     attention: reviewRequired ? autofill?.result?.attention || null : null,
+    pauseDetails: reviewRequired ? autofill?.result?.pauseDetails || autofill?.pauseDetails || null : null,
     handoffScope: buildHandoffScopeSummary(
       summary,
       reviewRequired,
       autofill?.result?.wealthPrepared,
       {
-        route: autofill?.result?.routeScope,
+        route: autofill?.result?.routeScope || navigation?.result?.routeScope || null,
+        bankProfit: autofill?.result?.bankProfit || null,
         salarySummary: autofill?.result?.salarySummary,
         salaryIncluded: autofill?.result?.salaryIncluded,
         pensionSummary: autofill?.result?.pensionSummary,
@@ -9827,6 +10662,7 @@ async function runLocalWorkerCycle() {
       `Job claimed: ${job.type || job.jobType || "unknown"} (${job.status || "?"}) — starting automation [build ${AGENT_BUILD_TAG}]`,
     );
 
+    activeJobProcessing = true;
     await processLocalJob(job);
   } catch (error) {
     pushStatus(
@@ -9836,6 +10672,7 @@ async function runLocalWorkerCycle() {
         : "The local desktop worker encountered an unexpected error.",
     );
   } finally {
+    activeJobProcessing = false;
     localWorkerRunning = false;
   }
 }
@@ -10041,17 +10878,26 @@ function createMainWindow() {
 }
 
 function scheduleAutoCapture(reason) {
-  clearAutoCaptureTimer();
-
   if (!loginWindow || loginWindow.isDestroyed()) {
+    clearAutoCaptureTimer();
     return;
   }
 
-  if (!launchState.token || !launchState.apiBaseUrl) {
+  const apiBaseUrl = getApiBaseUrl();
+  const hasLaunchOrDeviceToken = Boolean(
+    launchState.token ||
+      launchState.deviceAuthToken ||
+      loadAgentState().deviceAuthToken,
+  );
+  if (!hasLaunchOrDeviceToken || !apiBaseUrl) {
     return;
   }
 
   if (autoCaptureState.inProgress || autoCaptureState.completed) {
+    return;
+  }
+
+  if (autoCaptureTimer) {
     return;
   }
 
@@ -10075,7 +10921,11 @@ async function attemptAutoCapture(reason) {
     return;
   }
 
-  if (!launchState.token || !launchState.apiBaseUrl) {
+  const apiBaseUrl = getApiBaseUrl();
+  const hasDeviceToken = Boolean(
+    launchState.deviceAuthToken || loadAgentState().deviceAuthToken,
+  );
+  if ((!launchState.token && !hasDeviceToken) || !apiBaseUrl) {
     pushStatus(
       "error",
       "Return to the web app and start the connection again.",
@@ -10126,6 +10976,13 @@ async function attemptAutoCapture(reason) {
 
   try {
     await captureLoginWindowState();
+    if (
+      !(launchState.deviceAuthToken || loadAgentState().deviceAuthToken) &&
+      launchState.token &&
+      launchState.apiBaseUrl
+    ) {
+      await ensureTrustedDeviceRegistration();
+    }
     await markTrustedDeviceReady();
 
     autoCaptureState.completed = true;
@@ -10164,8 +11021,51 @@ function attachLoginWindowWatchers(windowInstance) {
   configurePortalChildWindows(windowInstance);
   const triggerIfReady = () => {
     if (windowInstance !== loginWindow || windowInstance.isDestroyed()) return;
-    if (isCurrentPortalReadyUrl(windowInstance.webContents.getURL()))
+    const currentUrl = windowInstance.webContents.getURL();
+    if (isCurrentPortalReadyUrl(currentUrl)) {
       scheduleAutoCapture("login-detected");
+    } else if (
+      autoCaptureState.completed &&
+      !localWorkerRunning &&
+      !autoCaptureState.inProgress &&
+      currentUrl &&
+      currentUrl !== "about:blank"
+    ) {
+      resetAutoCaptureState();
+      void notifyFbrDisconnected("portal_left_ready_url");
+    }
+  };
+  const checkIfLoggedOut = async () => {
+    if (
+      windowInstance !== loginWindow ||
+      windowInstance.isDestroyed() ||
+      !autoCaptureState.completed ||
+      localWorkerRunning ||
+      autoCaptureState.inProgress ||
+      launchState.flow !== "fbr" ||
+      launchState.desktopAuthConfig?.useMockIris
+    ) {
+      return;
+    }
+    try {
+      const inspection = await irisNavigation.probeFrames(windowInstance);
+      const frames = inspection?.frames || [];
+      if (
+        frames.some(
+          (frame) =>
+            frame.loginVisible || frame.readiness?.explicitSessionExpired,
+        )
+      ) {
+        resetAutoCaptureState();
+        void notifyFbrDisconnected("portal_logged_out");
+        pushStatus(
+          "progress",
+          "FBR session signed out or expired. Click Reconnect securely in TaxRocket to sign in again.",
+        );
+      }
+    } catch {
+      // Ignore transient frame-probe failures while page is transitioning.
+    }
   };
   for (const event of [
     "did-finish-load",
@@ -10174,6 +11074,11 @@ function attachLoginWindowWatchers(windowInstance) {
     "did-stop-loading",
   ]) {
     windowInstance.webContents.on(event, triggerIfReady);
+  }
+  for (const event of ["did-finish-load", "did-navigate"]) {
+    windowInstance.webContents.on(event, () => {
+      void checkIfLoggedOut();
+    });
   }
   const timer = setInterval(triggerIfReady, 2500);
   windowInstance.on("closed", () => {
@@ -10187,11 +11092,23 @@ function attachLoginWindowWatchers(windowInstance) {
       lastTourStateKey = null;
     }
     if (workerWindow === windowInstance) workerWindow = null;
+    if (!hasLivePortalWindow()) {
+      void notifyFbrDisconnected("portal_window_closed");
+    }
   });
 }
 
 async function createLoginWindow(openFresh = false) {
-  if (loginWindowPromise) return loginWindowPromise;
+  if (loginWindowPromise) {
+    if (loginWindow && !loginWindow.isDestroyed()) {
+      if (typeof loginWindow.isMinimized === "function" && loginWindow.isMinimized()) {
+        loginWindow.restore();
+      }
+      loginWindow.show();
+      loginWindow.focus();
+    }
+    return loginWindowPromise;
+  }
   loginWindowPromise = (async () => {
     if (
       launchState.token &&
@@ -10209,6 +11126,21 @@ async function createLoginWindow(openFresh = false) {
       windowInstance.close();
       windowInstance = null;
     }
+    const showAndFocus = (win) => {
+      if (!win || win.isDestroyed()) return;
+      if (typeof win.isMinimized === "function" && win.isMinimized()) {
+        win.restore();
+      }
+      win.show();
+      win.focus();
+    };
+    const loadLoginPage = async (win) => {
+      try {
+        await win.loadURL(loginUrl);
+      } catch (err) {
+        if (err?.code !== "ERR_ABORTED") throw err;
+      }
+    };
     if (!windowInstance) {
       windowInstance = new BrowserWindow({
         width: 1280,
@@ -10230,7 +11162,11 @@ async function createLoginWindow(openFresh = false) {
       windowInstance.taxRocketPartition = partition;
       loginWindow = windowInstance;
       attachLoginWindowWatchers(windowInstance);
-      await windowInstance.loadURL(loginUrl);
+      showAndFocus(windowInstance);
+      if (!isFbrPortalLive()) {
+        void notifyFbrDisconnected("portal_window_opened", true);
+      }
+      await loadLoginPage(windowInstance);
     } else {
       loginWindow = windowInstance;
       const currentUrl = windowInstance.webContents.getURL();
@@ -10238,15 +11174,18 @@ async function createLoginWindow(openFresh = false) {
         launchState.flow === "fbr" &&
         !launchState.desktopAuthConfig.useMockIris &&
         irisNavigation.isAllowedPortalUrl(currentUrl);
+      showAndFocus(windowInstance);
+      if (!isFbrPortalLive()) {
+        void notifyFbrDisconnected("portal_window_opened", true);
+      }
       if (
         !retainLivePage &&
         (openFresh || !currentUrl || currentUrl === "about:blank")
       ) {
-        await windowInstance.loadURL(loginUrl);
+        await loadLoginPage(windowInstance);
       }
     }
-    windowInstance.show();
-    windowInstance.focus();
+    showAndFocus(windowInstance);
     scheduleAutoCapture("login-detected");
     startLocalWorkerLoop();
     return windowInstance;
@@ -10332,13 +11271,14 @@ async function captureLoginWindowState() {
 async function markTrustedDeviceReady() {
   const deviceAuthToken =
     launchState.deviceAuthToken || loadAgentState().deviceAuthToken;
+  const apiBaseUrl = getApiBaseUrl();
 
-  if (!deviceAuthToken || !launchState.apiBaseUrl) {
+  if (!deviceAuthToken || !apiBaseUrl) {
     throw new Error("No trusted desktop device token is available yet.");
   }
 
   const response = await fetch(
-    `${launchState.apiBaseUrl}${getTrustedDeviceReadyEndpoint()}`,
+    `${apiBaseUrl}${getTrustedDeviceReadyEndpoint()}`,
     {
       method: "POST",
       headers: {
@@ -10501,11 +11441,11 @@ if (!singleInstanceLock) {
     createMainWindow();
     loadAgentState();
     startLocalBridgeServer();
-    startLocalWorkerLoop();
 
     const deepLink = getDeepLinkArgument(process.argv);
-    if (deepLink) {
-      applyLaunchUrl(deepLink);
+    const handledDeepLink = deepLink ? applyLaunchUrl(deepLink) : false;
+    if (!handledDeepLink) {
+      startLocalWorkerLoop();
     }
 
     app.on("activate", () => {
@@ -10519,6 +11459,27 @@ if (!singleInstanceLock) {
 app.on("open-url", (event, url) => {
   event.preventDefault();
   applyLaunchUrl(url);
+});
+
+let quitDisconnectAttempted = false;
+app.on("before-quit", (event) => {
+  clearLocalWorkerTimer();
+  if (quitDisconnectAttempted) return;
+  const token =
+    launchState.deviceAuthToken || loadAgentState().deviceAuthToken;
+  const apiBaseUrl = getApiBaseUrl();
+  if (!token || !apiBaseUrl) {
+    quitDisconnectAttempted = true;
+    return;
+  }
+  event.preventDefault();
+  quitDisconnectAttempted = true;
+  Promise.race([
+    notifyFbrDisconnected("agent_quit", false),
+    new Promise((resolve) => setTimeout(resolve, 400)),
+  ])
+    .catch(() => null)
+    .finally(() => app.quit());
 });
 
 app.on("window-all-closed", () => {

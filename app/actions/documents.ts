@@ -158,6 +158,11 @@ export async function uploadFilingDocumentAction(formData: FormData) {
     const suppliedBankAccountId = String(
       formData.get("bankAccountId") ?? "",
     ).trim();
+    const appendDocument =
+      String(formData.get("appendDocument") ?? "").trim() === "true";
+    const replaceDocumentId = String(
+      formData.get("replaceDocumentId") ?? "",
+    ).trim();
     const slotResolution = resolveFilingDocumentSlot(
       requestedDocumentType,
       suppliedBankAccountId,
@@ -172,6 +177,17 @@ export async function uploadFilingDocumentAction(formData: FormData) {
     }
 
     const { documentType, bankAccountId, dividendSubcategory, bankProfitSubcategory = null } = slotResolution;
+    const supportsMultiCertificate =
+      documentType === "bank_certificate" &&
+      (bankProfitSubcategory === "bank-or-financial-institution-deposit" ||
+        bankProfitSubcategory === "other-profit-on-debt");
+    if (appendDocument && !supportsMultiCertificate) {
+      return {
+        success: false,
+        error:
+          "Additional certificates can only be added for Bank Deposit or Other Profit on Debt categories.",
+      };
+    }
 
     if (file.size === 0 || file.size > MAX_FILE_SIZE) {
       return {
@@ -316,6 +332,27 @@ export async function uploadFilingDocumentAction(formData: FormData) {
       };
     }
 
+    if (supportsMultiCertificate) {
+      const duplicateInCategory = await prisma.document.findFirst({
+        where: {
+          filingDraftId: draft.id,
+          userId: user.id,
+          documentType: "bank_certificate",
+          bankProfitSubcategory,
+          fileName: file.name,
+          ...(replaceDocumentId ? { id: { not: replaceDocumentId } } : {}),
+        },
+        select: { id: true },
+      });
+      if (duplicateInCategory) {
+        return {
+          success: false,
+          error:
+            "This certificate file is already uploaded in this Bank Profit category. Upload a different certificate or replace the existing one.",
+        };
+      }
+    }
+
     const uploadDirectory = path.join(process.cwd(), "uploads");
     await mkdir(uploadDirectory, { recursive: true });
 
@@ -343,17 +380,30 @@ export async function uploadFilingDocumentAction(formData: FormData) {
           }
         }
 
-        const previousDocument = await tx.document.findFirst({
-          where: buildFilingDocumentSlotWhere(
-            draft.id,
-            user.id,
-            documentType,
-            bankAccountId,
-            dividendSubcategory,
-            bankProfitSubcategory,
-          ),
-          orderBy: { createdAt: "desc" },
-        });
+        const previousDocument = appendDocument
+          ? null
+          : replaceDocumentId && supportsMultiCertificate
+            ? await tx.document.findFirst({
+                where: {
+                  id: replaceDocumentId,
+                  filingDraftId: draft.id,
+                  userId: user.id,
+                  documentType: "bank_certificate",
+                  bankProfitSubcategory,
+                },
+                orderBy: { createdAt: "desc" },
+              })
+            : await tx.document.findFirst({
+                where: buildFilingDocumentSlotWhere(
+                  draft.id,
+                  user.id,
+                  documentType,
+                  bankAccountId,
+                  dividendSubcategory,
+                  bankProfitSubcategory,
+                ),
+                orderBy: { createdAt: "desc" },
+              });
 
         const createdDocument = await tx.document.create({
           data: {
@@ -611,7 +661,26 @@ export async function removeFilingDocumentAction(documentId: string) {
           incomeSources: flowIncomeSources as TaxIncomeSource[],
         }),
       );
-      if (requiredTypes.has(document.documentType)) {
+      let allowExtraBankCertificateRemoval = false;
+      if (
+        document.documentType === "bank_certificate" &&
+        document.bankProfitSubcategory
+      ) {
+        const siblingCount = await prisma.document.count({
+          where: {
+            filingDraftId: document.filingDraftId,
+            userId: user.id,
+            documentType: "bank_certificate",
+            bankProfitSubcategory: document.bankProfitSubcategory,
+            id: { not: document.id },
+          },
+        });
+        allowExtraBankCertificateRemoval = siblingCount >= 1;
+      }
+      if (
+        requiredTypes.has(document.documentType) &&
+        !allowExtraBankCertificateRemoval
+      ) {
         return {
           success: false,
           error:
@@ -686,6 +755,15 @@ export async function removeFilingDocumentAction(documentId: string) {
           data: { status: "SUPERSEDED", approvalStatus: "SUPERSEDED" },
         });
         if (
+          document.documentType === "bank_certificate" ||
+          document.documentType === "dividend_certificate"
+        ) {
+          await invalidateFilingForDocumentChange(
+            tx,
+            document.filingDraftId,
+            user.id,
+          );
+        } else if (
           [
             "business_balance_sheet",
             "business_books",

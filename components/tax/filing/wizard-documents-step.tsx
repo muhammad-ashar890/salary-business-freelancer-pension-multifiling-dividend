@@ -106,6 +106,8 @@ export type WizardDocumentSlot = {
   label: string;
   reason: string;
   required: boolean;
+  allowAddBankProfitCertificate?: boolean;
+  removableDocument?: boolean;
 };
 
 type WizardDocumentsStepProps = Readonly<{
@@ -143,6 +145,7 @@ type WizardDocumentsStepProps = Readonly<{
   handleDocumentFileSelected: (
     documentType: string,
     fileList: FileList | null,
+    uploadOptions?: { append?: boolean },
   ) => void;
   handleExtractDocument: (documentType: string) => void;
   handleReviewDocument: (documentType: string) => void;
@@ -221,6 +224,7 @@ export function WizardDocumentsStep({
 
   const taxYearBounds = getTaxYearDateInputBounds(taxYear);
   const documentErrorRef = useRef<HTMLDivElement | null>(null);
+  const addBankProfitCertInputsRef = useRef<Record<string, HTMLInputElement | null>>({});
 
   useEffect(() => {
     if (!documentUploadError) return;
@@ -322,6 +326,8 @@ export function WizardDocumentsStep({
           const isCnicDocument = slot.documentType === "cnic";
           const isSalaryCertificate =
             slot.documentType === "salary_certificate";
+          const isBankProfitCertificate =
+            slot.documentType === "bank_certificate";
           const isPensionStatement =
             slot.documentType === "pension_statement";
           const isMappableDocument =
@@ -506,8 +512,24 @@ export function WizardDocumentsStep({
                     event.currentTarget.value = "";
                   }}
                 />
+                {slot.allowAddBankProfitCertificate && (
+                  <input
+                    ref={(element) => {
+                      addBankProfitCertInputsRef.current[slotKey] = element;
+                    }}
+                    type="file"
+                    accept=".pdf,.jpg,.jpeg,.png"
+                    className="hidden"
+                    onChange={(event) => {
+                      handleDocumentFileSelected(slotKey, event.target.files, {
+                        append: true,
+                      });
+                      event.currentTarget.value = "";
+                    }}
+                  />
+                )}
 
-                <div className="flex w-full shrink-0 gap-2 sm:w-auto">
+                <div className="flex w-full shrink-0 flex-wrap gap-2 sm:w-auto">
                   <Button
                     type="button"
                     variant={uploadedFileName ? "outline" : "default"}
@@ -528,8 +550,25 @@ export function WizardDocumentsStep({
                         : "Upload"}
                   </Button>
 
+                  {slot.allowAddBankProfitCertificate && uploadedFileName && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="min-w-0 flex-1 gap-1.5 sm:w-auto"
+                      onClick={() =>
+                        addBankProfitCertInputsRef.current[slotKey]?.click()
+                      }
+                      disabled={isUploading || isExtracting || isMapping}
+                    >
+                      <Upload className="h-3.5 w-3.5" />
+                      Add another certificate
+                    </Button>
+                  )}
+
                   {uploadedFileName &&
                     (!slotRequired ||
+                      slot.removableDocument ||
                       (slot.documentType === "previous_return" &&
                         previousReturnRequiredByFiler)) && (
                       <Button
@@ -643,7 +682,9 @@ export function WizardDocumentsStep({
                         {isMapped
                           ? isPensionStatement
                             ? "Pension source is approved. Editing requires Save & Approve Map again, then a new tax calculation and packet. Changes are not applied until saved."
-                            : employersEditableAfterMap
+                            : isBankProfitCertificate
+                              ? "Bank-profit certificate is approved. Any correction requires Save & Approve Map again; values or tax treatment are not inferred."
+                              : employersEditableAfterMap
                             ? "This document is already mapped. The values below are read-only, except the employer names: change them and press Save employer."
                             : purchaseBasisMissing
                               ? "Books are mapped, but the purchase tax basis still needs to be confirmed and re-approved; other persisted amounts remain read-only."
@@ -706,6 +747,7 @@ export function WizardDocumentsStep({
                       )}
                     {isMapped &&
                     isMappableDocument &&
+                    !isBankProfitCertificate &&
                     !ibanEditableAfterMap &&
                     !employersEditableAfterMap &&
                     !purchaseBasisMissing ? (
@@ -716,7 +758,7 @@ export function WizardDocumentsStep({
                         </Button>
                       </div>
                     ) : (
-                      (!isMapped || purchaseBasisMissing) && (
+                      (!isMapped || purchaseBasisMissing || isBankProfitCertificate) && (
                         <div className="flex flex-wrap gap-2 sm:justify-end">
                           {isMappableDocument ? (
                             <Button
@@ -783,6 +825,18 @@ export function WizardDocumentsStep({
                       149 are required. Verify both against the certificate;
                       enter 0 only if the certificate confirms that no salary
                       tax was withheld.
+                    </p>
+                  )}
+
+                  {isBankProfitCertificate && (
+                    <p className="mb-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900">
+                      Copy the bank&apos;s printed instrument/category, Section /
+                      subsection, applied rate, ATL status, and Sukuk details
+                      exactly; do not infer a tax rule. Enter at least one
+                      taxpayer ID (CNIC or NTN) and one account ID (account
+                      number or IBAN). Gross profit minus tax withheld must
+                      equal net profit credited. A zero withholding amount must
+                      be confirmed from the certificate, not assumed.
                     </p>
                   )}
 
@@ -1198,11 +1252,13 @@ export function WizardDocumentsStep({
                               )}
                               {typeof field.confidence === "number" &&
                                 field.confidence > 0 &&
-                                // A missing pension fact has no confidence to
-                                // show: a stale extraction score must not make
-                                // an unstated amount look verified.
+                                // A missing pension or bank-profit-certificate
+                                // fact has no confidence to show: a stale
+                                // extraction score must not make an unstated
+                                // or unread value look verified.
                                 !(
-                                  isPensionStatement &&
+                                  (isPensionStatement ||
+                                    isBankProfitCertificate) &&
                                   (field.value === null ||
                                     field.value === undefined ||
                                     String(field.value).trim() === "")
@@ -1283,6 +1339,7 @@ export function WizardDocumentsStep({
                               }
                               readOnly={
                                 isMapped &&
+                                !isBankProfitCertificate &&
                                 !(
                                   ibanEditableAfterMap &&
                                   isBankStatementIbanLabel(field.label)
@@ -1450,7 +1507,7 @@ export function WizardDocumentsStep({
                                           value={String(transaction[key] ?? "")}
                                           onChange={(event) =>
                                             handleExtractedTransactionChange(
-                                              slot.documentType,
+                                              slotKey,
                                               transactionIndex,
                                               { [key]: event.target.value },
                                             )

@@ -1724,16 +1724,12 @@ export async function generateFilingPacketAction(
         (draftData.taxYear !== 2026 || draftData.filerType !== "myself" || parsedIncomeSources.length !== 1)) {
       return {success:false,error:"Bank Profit packets support only TY2026 Myself Bank Profit-only filings. Untested combinations remain blocked."};
     }
-    // Bank Profit desktop safety gate (opens only with TAXROCKET_BANK_PROFIT_PACKET=on).
-    // 19-Nov-2026: the evidence, plan, freshness validator and desktop driver
-    // were already complete and tested, so this is now an explicit opt-in
-    // instead of a permanent block. Default OFF means every unconfigured
-    // deployment behaves exactly as before. Once ON, every guard below
-    // (evidence, plan, freshness rereads, desktop contract, Wealth proof)
-    // still applies unchanged.
+    // Bank Profit desktop safety gate (enabled by default; TAXROCKET_BANK_PROFIT_PACKET=off disables it).
+    // Every guard below (source-set, evidence, plan, freshness rereads,
+    // desktop contract, Wealth proof) remains enforced unconditionally.
     const bankProfitGate = bankProfitEnablement();
     if (parsedIncomeSources.includes("bank_profit") && !bankProfitGate.enabled) {
-      return {success:false,error:"Bank Profit packets remain blocked by default; set TAXROCKET_BANK_PROFIT_PACKET=on for a supervised test run. Coverage override cannot bypass this gate."};
+      return {success:false,error:"Bank Profit packets are disabled via TAXROCKET_BANK_PROFIT_PACKET=off. Coverage override cannot bypass this gate."};
     }
 
     // Standalone TY2026 cash Dividend is admitted only after the source,

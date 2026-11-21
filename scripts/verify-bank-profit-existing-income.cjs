@@ -244,3 +244,102 @@ test("the guard is read-only: it exposes no writer and returns no write plan", (
   const out = guard.checkExistingBankProfitIncome(census([]), route());
   assert.deepEqual(Object.keys(out).sort(), ["conflicts", "ok", "reason"]);
 });
+
+test("multi-certificate route matches multiple distinct detail rows by description and refuses foreign or mismatched rows", () => {
+  const multiRoute = {
+    active: true,
+    rows: [
+      {
+        irisCode: "64040052",
+        label: "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits",
+        detailMode: "investment",
+        investment: "Savings Account",
+        contents: "1. PK111\n2. Savings Account\n3. Alpha Bank",
+        values: [
+          { columnIndex: 0, value: "1000000" },
+          { columnIndex: 1, value: "150000" },
+        ],
+      },
+      {
+        irisCode: "64040052",
+        label: "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits",
+        detailMode: "investment",
+        investment: "Term Deposit",
+        contents: "1. PK222\n2. Term Deposit\n3. Beta Bank",
+        values: [
+          { columnIndex: 0, value: "500000" },
+          { columnIndex: 1, value: "75000" },
+        ],
+      },
+    ],
+  };
+
+  // Matches both detail rows + parent summary with combined total
+  const okOut = guard.checkExistingBankProfitIncome(
+    census([
+      { code: "64040052", description: "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits", gross: "1500000", tax: "225000" },
+      { code: "64040052", description: "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits - Savings Account - 1. PK111\n2. Savings Account\n3. Alpha Bank", gross: "1000000", tax: "150000" },
+      { code: "64040052", description: "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits  -  Term Deposit  -  1. PK222\n2. Term Deposit\n3. Beta Bank", gross: "500000", tax: "75000" },
+    ]),
+    multiRoute,
+  );
+  assert.equal(okOut.ok, true, okOut.reason);
+
+  // Refuses mismatched detail amount
+  const badAmt = guard.checkExistingBankProfitIncome(
+    census([
+      { code: "64040052", description: "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits - Savings Account - 1. PK111\n2. Savings Account\n3. Alpha Bank", gross: "999999", tax: "150000" },
+    ]),
+    multiRoute,
+  );
+  assert.equal(badAmt.ok, false);
+  assert.match(badAmt.conflicts[0].reason, /differs from the approved packet/);
+
+  // Refuses foreign unrecognized detail row under same code
+  const foreignRow = guard.checkExistingBankProfitIncome(
+    census([
+      { code: "64040052", description: "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits - Foreign Bond - 1. X\n2. Foreign Bond\n3. Z", gross: "100000", tax: "15000" },
+    ]),
+    multiRoute,
+  );
+  assert.equal(foreignRow.ok, false);
+  assert.match(foreignRow.conflicts[0].reason, /not part of the approved packet/);
+
+  // Accepts an FBR-prepopulated MIS detail row alongside a second unadded certificate when amounts uniquely match
+  const fbrPrepopulatedMulti = guard.checkExistingBankProfitIncome(
+    census([
+      { code: "64040052", description: "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits", gross: "500000", tax: "75000" },
+      { code: "64040052", description: "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits--123456-BETA BANK", gross: "500000", tax: "75000" },
+      { code: "64040052", description: "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits-MIS", gross: "0", tax: "0" },
+    ].slice(0, 2)),
+    multiRoute,
+  );
+  assert.equal(fbrPrepopulatedMulti.ok, true, fbrPrepopulatedMulti.reason);
+
+  // Supports label-suffix without space as a detail row
+  const hyphenNoSpace = guard.checkExistingBankProfitIncome(
+    census([
+      { code: "64040052", description: "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits", gross: "500000", tax: "75000" },
+      { code: "64040052", description: "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits-MIS BANK", gross: "500000", tax: "75000" },
+    ]),
+    multiRoute,
+  );
+  assert.equal(hyphenNoSpace.ok, true, hyphenNoSpace.reason);
+
+  // Refuses ambiguous FBR-prepopulated MIS row when two packet certificates share identical amounts
+  const identicalAmountsRoute = {
+    active: true,
+    rows: [
+      { ...multiRoute.rows[0], values: [{ columnIndex: 0, value: "500000" }, { columnIndex: 1, value: "75000" }] },
+      { ...multiRoute.rows[1], values: [{ columnIndex: 0, value: "500000" }, { columnIndex: 1, value: "75000" }] },
+    ],
+  };
+  const ambiguousFbr = guard.checkExistingBankProfitIncome(
+    census([
+      { code: "64040052", description: "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits", gross: "500000", tax: "75000" },
+      { code: "64040052", description: "Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits--MIS", gross: "500000", tax: "75000" },
+    ]),
+    identicalAmountsRoute,
+  );
+  assert.equal(ambiguousFbr.ok, false);
+});

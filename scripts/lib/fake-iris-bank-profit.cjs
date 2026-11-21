@@ -186,11 +186,14 @@ class FakeIrisBankProfit {
   }
 
   addDetailRow(investment = "existing investment", contents = "existing contents") {
-    const parent = this.rows().find((row) => !row.classList.contains("section-detail-child-row"));
-    if (!parent || this.rows().some((row) => row.classList.contains("section-detail-child-row"))) return;
+    const existingRows = this.rows();
+    const parent = existingRows.find((row) => !row.classList.contains("section-detail-child-row"));
+    const normDesc = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
+    const fullDescription = `${this.label} - ${investment} - ${contents}`;
+    if (!parent || existingRows.some((row) => row.classList.contains("section-detail-child-row") && normDesc(row.querySelector(".row-description-text")?.textContent) === normDesc(fullDescription))) return;
     const detail = this.makeRow(true);
-    detail.querySelector(".row-description-text").textContent = `${this.label} - ${investment} - ${contents}`;
-    this.insertAfter(detail, parent);
+    detail.querySelector(".row-description-text").textContent = fullDescription;
+    this.insertAfter(detail, existingRows[existingRows.length - 1] || parent);
   }
 
   addRows({ malformed = false, code = this.code, label = this.label, detail: includeDetail = true } = {}) {

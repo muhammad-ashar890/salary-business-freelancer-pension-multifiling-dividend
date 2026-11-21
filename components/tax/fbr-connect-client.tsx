@@ -25,8 +25,10 @@ import {
   resumeJobAfterPauseAction,
   getTrustedDevicesAction,
   type JobAttention,
+  type JobPauseDetails,
 } from "@/app/actions/fbr-jobs";
 import { FbrAttentionPanel } from "@/components/tax/fbr-attention-panel";
+import { FbrPausePanel } from "@/components/tax/fbr-pause-panel";
 
 type Props = Readonly<{
   draftId?: string;
@@ -65,6 +67,8 @@ type JobView = {
   errorMessage: string | null;
   /** What the agent could not enter, as a list (review pause only). */
   attention?: JobAttention | null;
+  /** Structured explanation & next steps for any paused run. */
+  pauseDetails?: JobPauseDetails | null;
   createdAt: string | Date;
   startedAt: string | Date | null;
   completedAt: string | Date | null;
@@ -83,6 +87,8 @@ type JobView = {
     salaryFields?: { total: number; filled: number; skipped: number };
     pension?: string | null;
     pensionFields?: { total: number; filled: number; skipped: number };
+    bankProfit?: string | null;
+    dividend?: string | null;
     wealthStatement: string | null;
     wealthRows: number;
     employers: string | null;
@@ -201,9 +207,10 @@ const ACTIVE_JOB_STATUSES = new Set([
 
 // The desktop worker polls /api/local-agent/jobs/next every ~10s, which
 // refreshes TrustedDevice.lastSeenAt. A device only counts as connected
-// while that heartbeat is fresh; otherwise closing the agent left the flow
-// stuck on "Start filing" with no way back to Step 1 to reconnect.
-const AGENT_HEARTBEAT_FRESH_MS = 45_000;
+// while that heartbeat is fresh AND the FBR portal window itself is open and
+// signed in; otherwise closing the agent or the FBR window must leave the flow
+// in a reconnect-only state (never showing Connected or Start filing).
+const AGENT_HEARTBEAT_FRESH_MS = 25_000;
 // A just-created session shows a WAITING phase, never an authenticated-ready
 // state (session expiry is creation time + 10 minutes).
 const SESSION_GRACE_MS = 2 * 60_000;
@@ -270,6 +277,7 @@ export default function FbrConnectClient({
   const [sessionLoading, setSessionLoading] = useState(false);
   const [jobs, setJobs] = useState<JobView[]>([]);
   const [devices, setDevices] = useState<DeviceView[]>([]);
+  const [fbrWindowOpen, setFbrWindowOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [startOver, setStartOver] = useState(false);
@@ -304,6 +312,7 @@ export default function FbrConnectClient({
       }
       if (deviceResult.success && deviceResult.devices) {
         setDevices(deviceResult.devices as DeviceView[]);
+        setFbrWindowOpen(Boolean(deviceResult.fbrWindowOpen));
       }
     };
 
@@ -337,6 +346,7 @@ export default function FbrConnectClient({
     const result = await getTrustedDevicesAction(draftId);
     if (result.success && result.devices) {
       setDevices(result.devices as DeviceView[]);
+      setFbrWindowOpen(Boolean(result.fbrWindowOpen));
     }
   }
 
@@ -344,7 +354,6 @@ export default function FbrConnectClient({
     if (!draftId) return;
     setSessionLoading(true);
     setError(null);
-    setDevices([]);
     try {
       await startFbrConnectionAction(draftId);
       const res = await fetch("/api/fbr-connect/desktop/session", {
@@ -356,6 +365,8 @@ export default function FbrConnectClient({
       if (!data.success) {
         setError(data.error || "Could not open the FBR connection app");
       } else {
+        setDevices([]);
+        setFbrWindowOpen(false);
         setSession(data.session);
         // Use ONE transport. The old POST did not meet the bridge's nonce/
         // allowlist contract and also triggered the protocol unconditionally.
@@ -370,10 +381,43 @@ export default function FbrConnectClient({
     void refreshConnection();
   }
 
+  function findReadyDevice(list: DeviceView[]) {
+    return list
+      .filter(
+        (d) =>
+          d.status === "ACTIVE" &&
+          d.localFbrConnectedAt &&
+          (!session ||
+            (d.partitionKey === session.partitionKey &&
+              new Date(d.localFbrConnectedAt).getTime() >=
+                new Date(session.expiresAt).getTime() - SESSION_TTL_MS)) &&
+          d.lastSeenAt &&
+          Date.now() - new Date(d.lastSeenAt).getTime() <
+            AGENT_HEARTBEAT_FRESH_MS,
+      )
+      .sort((a, b) => {
+        const at = a.lastSeenAt ? new Date(a.lastSeenAt).getTime() : 0;
+        const bt = b.lastSeenAt ? new Date(b.lastSeenAt).getTime() : 0;
+        return bt - at;
+      })[0];
+  }
+
   async function handleStartFiling() {
     if (!draftId) return;
     setActionLoading("assisted");
     setError(null);
+    const deviceResult = await getTrustedDevicesAction(draftId);
+    if (deviceResult.success && Array.isArray(deviceResult.devices)) {
+      const latestDevices = deviceResult.devices as DeviceView[];
+      setDevices(latestDevices);
+      if (!findReadyDevice(latestDevices)) {
+        setActionLoading(null);
+        setError(
+          "FBR is not connected right now. Click Reconnect securely to open FBR first.",
+        );
+        return;
+      }
+    }
     const result = await queueAssistedFilingJobAction(draftId);
     setActionLoading(null);
     if (!result.success) {
@@ -440,15 +484,11 @@ export default function FbrConnectClient({
     }
   }
 
-  const readyDevice = devices
+  const readyDevice = findReadyDevice(devices);
+  const activeDesktopDevice = devices
     .filter(
       (d) =>
         d.status === "ACTIVE" &&
-        d.localFbrConnectedAt &&
-        (!session ||
-          (d.partitionKey === session.partitionKey &&
-            new Date(d.localFbrConnectedAt).getTime() >=
-              new Date(session.expiresAt).getTime() - SESSION_TTL_MS)) &&
         d.lastSeenAt &&
         Date.now() - new Date(d.lastSeenAt).getTime() <
           AGENT_HEARTBEAT_FRESH_MS,
@@ -463,6 +503,7 @@ export default function FbrConnectClient({
     Date.now() - (new Date(session!.expiresAt).getTime() - SESSION_TTL_MS) <
       SESSION_GRACE_MS;
   const agentReady = Boolean(readyDevice);
+  const agentDesktopOnline = Boolean(activeDesktopDevice);
   const activeJob = jobs.find((j) => ACTIVE_JOB_STATUSES.has(j.status));
   const completedAgentJob = jobs.find(
     (j) => j.jobType !== "tax_dry_run" && j.status === "completed",
@@ -472,7 +513,7 @@ export default function FbrConnectClient({
   if (activeJob?.status === "awaiting_user_action") phase = "resume";
   else if (activeJob) phase = "working";
   else if (completedAgentJob && agentReady && !startOver) phase = "done";
-  else if (agentReady) phase = "start";
+  else if (agentReady || agentDesktopOnline) phase = "start";
   else if (sessionFresh || sessionLoading) phase = "connecting";
 
   const inspectionPause = Boolean(
@@ -604,84 +645,220 @@ export default function FbrConnectClient({
               Sign in to FBR in the window that opened. Keep that window open
               while TaxRocket prepares your filing.
             </p>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={sessionLoading}
-              onClick={handleCreateSession}
-            >
-              Reopen FBR connection
-            </Button>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={sessionLoading}
+                onClick={handleCreateSession}
+              >
+                Reopen FBR connection
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={sessionLoading}
+                onClick={() => setSession(null)}
+              >
+                Back
+              </Button>
+            </div>
           </CardContent>
         </Card>
       )}
 
       {phase === "start" && (
         <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="flex items-center gap-2 text-sm">
-              <ShieldCheck className="h-4 w-4" /> Step 2 — Start your filing
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3 text-sm">
-            <p className="text-muted-foreground">
-              Your secure FBR connection is ready
-              {readyDevice?.deviceName ? ` on ${readyDevice.deviceName}` : ""}.
-              Click Start filing to open your approved return in FBR. Complete
-              sign-in, OTP, CAPTCHA, or PIN steps yourself in the FBR window.
-              TaxRocket pauses whenever it needs you.{" "}
-              {servicesRoute
-                ? "On a Freelancer / Services route (including Salary, Pension, Business, or Salary + Business combinations) it enters only the evidence-backed figures in each approved source scope, plus queued Wealth rows when Wealth entry is on. After every scoped figure passes readback and the Wealth reconciliation has no known gap, it may press Save once at the end. It never prepares PSID, makes payment or Submits."
-                : "When every figure it typed reads back the same, it presses Save once at the end to keep them in your FBR draft; it never submits or pays."}
-            </p>
-            {liveFilingEnabled && (
-              <div
-                role="alert"
-                className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-400"
-              >
-                <span className="font-medium">
-                  Your filing is ready for supervised entry.
-                </span>{" "}
-                {servicesRoute
-                  ? "TaxRocket will enter only evidence-backed Services figures in Business > Other Revenues / Tax Deduction and the approved Salary or Pension companion fields for the selected route. Wealth Statement rows are entered only if the agent's Wealth switch is on. If all scoped figures pass readback, it will press Save once at the end. It will not prepare PSID, make payment or Submit."
-                  : "TaxRocket will enter only the approved Salary and Salary withholding information that can be verified. Wealth Statement rows are entered only if the agent's Wealth switch is on. Property, Payments, and Computations remain outside this test. Nothing is saved or submitted."}
-              </div>
-            )}
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                size="sm"
-                disabled={!draftId || !readyDevice || !!actionLoading}
-                onClick={handleStartFiling}
-                className="gap-2"
-              >
-                {actionLoading === "assisted" ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Play className="h-3.5 w-3.5" />
-                )}
-                Start filing
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={sessionLoading}
-                onClick={handleCreateSession}
-                className="gap-2"
-              >
-                {sessionLoading ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Monitor className="h-3.5 w-3.5" />
-                )}
-                Reconnect securely
-              </Button>
+          <CardHeader className="pb-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <CardTitle className="flex items-center gap-2 text-sm">
+                <ShieldCheck
+                  className={`h-4 w-4 ${agentReady ? "text-emerald-600" : "text-amber-600"}`}
+                />{" "}
+                Step 2 — Start your filing
+              </CardTitle>
+              {agentReady ? (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-800 dark:border-emerald-800/60 dark:bg-emerald-950/40 dark:text-emerald-300">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                  Connected
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-300 bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-800 dark:border-amber-700/60 dark:bg-amber-950/40 dark:text-amber-300">
+                  <span className="h-1.5 w-1.5 rounded-full bg-amber-500" />
+                  {fbrWindowOpen ? "Sign in to FBR" : "FBR window not open"}
+                </span>
+              )}
             </div>
-            <p className="text-xs text-muted-foreground">
-              If the FBR window closes or pauses, choose &quot;Reconnect
-              securely&quot; to open a fresh connection. Your sensitive OTP,
-              CAPTCHA, and PIN stay in the FBR window and are never sent to
-              TaxRocket.
-            </p>
+          </CardHeader>
+          <CardContent className="space-y-4 text-sm">
+            {agentReady ? (
+              <>
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-emerald-200 bg-emerald-50/70 px-3.5 py-2.5 dark:border-emerald-800/60 dark:bg-emerald-950/30">
+                  <div className="flex items-center gap-2.5">
+                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-emerald-100 text-emerald-700 dark:bg-emerald-900/60 dark:text-emerald-300">
+                      <Monitor className="h-4 w-4" />
+                    </div>
+                    <div>
+                      <p className="text-xs font-semibold text-emerald-950 dark:text-emerald-100">
+                        Desktop agent connected
+                        {readyDevice?.deviceName
+                          ? ` · ${readyDevice.deviceName}`
+                          : ""}
+                      </p>
+                      <p className="text-xs text-emerald-800/80 dark:text-emerald-300/80">
+                        Secure FBR bridge ready
+                        {readyDevice?.localFbrConnectedAt
+                          ? ` · Since ${formatWhen(readyDevice.localFbrConnectedAt)}`
+                          : ""}
+                      </p>
+                    </div>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={sessionLoading}
+                    onClick={handleCreateSession}
+                    className="h-8 gap-1.5 border-emerald-300 bg-white/80 text-xs hover:bg-white dark:border-emerald-700 dark:bg-transparent"
+                  >
+                    {sessionLoading ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Monitor className="h-3.5 w-3.5" />
+                    )}
+                    Reconnect securely
+                  </Button>
+                </div>
+
+                <div className="space-y-2.5 rounded-lg border bg-muted/20 p-3.5">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    How supervised filing works
+                  </p>
+                  <ol className="space-y-2 text-xs leading-relaxed text-foreground">
+                    <li className="flex items-start gap-2">
+                      <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary/10 text-[10px] font-semibold text-primary">
+                        1
+                      </span>
+                      <span>
+                        <span className="font-medium">
+                          Sign in &amp; security checks in FBR:
+                        </span>{" "}
+                        Complete sign-in, OTP, CAPTCHA, or PIN steps yourself in
+                        the FBR window — they stay local and never leave your
+                        computer.
+                      </span>
+                    </li>
+                    <li className="flex items-start gap-2">
+                      <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary/10 text-[10px] font-semibold text-primary">
+                        2
+                      </span>
+                      <span>
+                        <span className="font-medium">
+                          Guided verification &amp; entry:
+                        </span>{" "}
+                        {servicesRoute
+                          ? "On a Freelancer / Services route (including Salary, Pension, Business, or Salary + Business combinations) it enters only the evidence-backed figures in each approved source scope, plus queued Wealth rows when Wealth entry is on."
+                          : "Click Start filing to open your approved return in FBR. TaxRocket checks existing FBR figures first and pauses whenever it needs you."}
+                      </span>
+                    </li>
+                    <li className="flex items-start gap-2">
+                      <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary/10 text-[10px] font-semibold text-primary">
+                        3
+                      </span>
+                      <span>
+                        <span className="font-medium">
+                          Safe Draft Save &amp; manual Submit:
+                        </span>{" "}
+                        {servicesRoute
+                          ? "After every scoped figure passes readback and the Wealth reconciliation has no known gap, it may press Save once at the end. It never prepares PSID, makes payment or Submits."
+                          : "When every figure it typed reads back the same, it presses Save once at the end to keep them in your FBR draft; it never submits or pays."}
+                      </span>
+                    </li>
+                  </ol>
+                </div>
+
+                {liveFilingEnabled && (
+                  <div
+                    role="alert"
+                    className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-xs leading-relaxed text-amber-800 dark:text-amber-300"
+                  >
+                    <span className="font-medium">
+                      Your filing is ready for supervised entry.
+                    </span>{" "}
+                    {servicesRoute
+                      ? "TaxRocket will enter only evidence-backed Services figures in Business > Other Revenues / Tax Deduction and the approved Salary or Pension companion fields for the selected route. Wealth Statement rows are entered only if the agent's Wealth switch is on. If all scoped figures pass readback, it will press Save once at the end. It will not prepare PSID, make payment or Submit."
+                      : "TaxRocket will enter only the approved Salary and Salary withholding information that can be verified. Wealth Statement rows are entered only if the agent's Wealth switch is on. Property, Payments, and Computations remain outside this test. Nothing is saved or submitted."}
+                  </div>
+                )}
+
+                <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                  <Button
+                    size="sm"
+                    disabled={!draftId || !readyDevice || !!actionLoading}
+                    onClick={handleStartFiling}
+                    className="gap-2"
+                  >
+                    {actionLoading === "assisted" ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Play className="h-3.5 w-3.5" />
+                    )}
+                    Start filing
+                  </Button>
+                  <p className="text-xs text-muted-foreground">
+                    FBR window closed or paused? Use{" "}
+                    <span className="font-medium text-foreground">
+                      Reconnect securely
+                    </span>{" "}
+                    above.
+                  </p>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50/70 px-3.5 py-3 dark:border-amber-800/60 dark:bg-amber-950/30">
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-amber-100 text-amber-700 dark:bg-amber-900/60 dark:text-amber-300">
+                    <Monitor className="h-4 w-4" />
+                  </div>
+                  <div>
+                    <p className="text-xs font-semibold text-amber-950 dark:text-amber-100">
+                      {fbrWindowOpen
+                        ? "FBR window open — sign in required"
+                        : "Desktop agent running"}
+                      {activeDesktopDevice?.deviceName
+                        ? ` · ${activeDesktopDevice.deviceName}`
+                        : ""}
+                    </p>
+                    <p className="mt-1 text-xs leading-relaxed text-amber-900/80 dark:text-amber-200/80">
+                      {fbrWindowOpen
+                        ? "The FBR IRIS window is open. Sign in with your CNIC/NTN, password, and any security checks in that window — Step 2 will unlock automatically once you sign in."
+                        : "TR Filing Agent is running, but the FBR IRIS window is closed. Click Reconnect securely to open FBR and sign in before starting your filing."}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                  <Button
+                    size="sm"
+                    variant={fbrWindowOpen ? "outline" : "default"}
+                    disabled={!draftId || sessionLoading}
+                    onClick={handleCreateSession}
+                    className="gap-2"
+                  >
+                    {sessionLoading ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Monitor className="h-3.5 w-3.5" />
+                    )}
+                    {fbrWindowOpen ? "Reopen FBR window" : "Reconnect securely"}
+                  </Button>
+                  <p className="text-xs text-muted-foreground">
+                    {fbrWindowOpen
+                      ? "Waiting for FBR sign-in in the open window."
+                      : "Once you sign in to FBR, you can begin your filing here."}
+                  </p>
+                </div>
+              </>
+            )}
           </CardContent>
         </Card>
       )}
@@ -833,10 +1010,29 @@ export default function FbrConnectClient({
         activeJob &&
         !completedEntry &&
         !isFinalSubmitPause(activeJob.pauseAction) && (
-          <Card className="border-amber-200">
+          <Card
+            className={
+              activeJob.pauseDetails?.tone === "red"
+                ? "border-red-200"
+                : "border-amber-200"
+            }
+          >
             <CardHeader className="pb-2">
-              <CardTitle className="flex items-center gap-2 text-sm text-amber-800">
-                <CheckCircle className="h-4 w-4" /> {completedEntry ? "Step 3 — Entry verified; review totals" : "Step 3 — Review & continue"}
+              <CardTitle
+                className={`flex items-center gap-2 text-sm ${
+                  activeJob.pauseDetails?.tone === "red"
+                    ? "text-red-800"
+                    : "text-amber-800"
+                }`}
+              >
+                <CheckCircle className="h-4 w-4" />{" "}
+                {completedEntry
+                  ? "Step 3 — Entry verified; review totals"
+                  : activeJob.pauseDetails?.requiresFbrAction === false &&
+                      !automaticRetryPause &&
+                      activeJob.pauseAction !== "portal_autofill_off"
+                    ? "Step 3 — Action needed before continuing"
+                    : "Step 3 — Review & continue"}
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-3 text-sm">
@@ -852,6 +1048,8 @@ export default function FbrConnectClient({
                     you again.
                   </p>
                 </>
+              ) : activeJob.pauseDetails ? (
+                <FbrPausePanel details={activeJob.pauseDetails} />
               ) : (
                 <>
                   <p>
@@ -902,57 +1100,78 @@ export default function FbrConnectClient({
                   </span>
                 </label>
               )}
-              {!completedEntry && <Button
-                size="sm"
-                disabled={
-                  actionLoading === activeJob.id ||
-                  (Boolean(ACKNOWLEDGEMENT_TEXT[activeJob.pauseAction || ""]) &&
-                    ackedKey !== `${activeJob.id}:${activeJob.pauseAction}`)
-                }
-                onClick={() =>
-                  handleResumeJob(
-                    activeJob.id,
-                    false,
-                    ACKNOWLEDGEMENT_TEXT[activeJob.pauseAction || ""],
-                  )
-                }
-                className="gap-2"
-              >
-                {actionLoading === activeJob.id ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <ExternalLink className="h-3.5 w-3.5" />
-                )}
-                {automaticRetryPause
-                  ? "Retry automatic filing"
-                  : activeJob.pauseAction === "portal_handoff_review"
-                    ? "I have reviewed it in FBR — Continue"
-                    : activeJob.pauseAction === "portal_employer_review"
-                      ? "I have added the employer in FBR — Continue"
-                      : activeJob.pauseAction === "portal_autofill_review"
-                        ? "I have entered them in FBR — Continue"
-                        : inspectionPause
-                          ? "Continue filing"
-                          : "Continue"}
-              </Button>}
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={actionLoading === activeJob.id}
-                onClick={() => handleCancelJob(activeJob.id)}
-              >
-                Cancel this filing
-              </Button>
-              {inspectionPause && !completedEntry && (
+              <div className="flex flex-wrap items-center gap-2">
+                {!completedEntry &&
+                  (activeJob.pauseDetails?.requiresFbrAction !== false ||
+                    automaticRetryPause ||
+                    activeJob.pauseAction === "portal_autofill_off" ||
+                    Boolean(ACKNOWLEDGEMENT_TEXT[activeJob.pauseAction || ""])) && (
+                    <Button
+                      size="sm"
+                      disabled={
+                        actionLoading === activeJob.id ||
+                        (Boolean(ACKNOWLEDGEMENT_TEXT[activeJob.pauseAction || ""]) &&
+                          ackedKey !== `${activeJob.id}:${activeJob.pauseAction}`)
+                      }
+                      onClick={() =>
+                        handleResumeJob(
+                          activeJob.id,
+                          false,
+                          ACKNOWLEDGEMENT_TEXT[activeJob.pauseAction || ""],
+                        )
+                      }
+                      className="gap-2"
+                    >
+                      {actionLoading === activeJob.id ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <ExternalLink className="h-3.5 w-3.5" />
+                      )}
+                      {automaticRetryPause
+                        ? "Retry automatic filing"
+                        : activeJob.pauseAction === "portal_handoff_review"
+                          ? "I have reviewed it in FBR — Continue"
+                          : activeJob.pauseAction === "portal_employer_review"
+                            ? "I have added the employer in FBR — Continue"
+                            : activeJob.pauseAction === "portal_autofill_review"
+                              ? "I have entered them in FBR — Continue"
+                              : inspectionPause
+                                ? "Continue filing"
+                                : "Continue"}
+                    </Button>
+                  )}
                 <Button
                   size="sm"
-                  variant="outline"
-                  disabled={sessionLoading}
-                  onClick={handleCreateSession}
+                  variant={
+                    !completedEntry &&
+                    activeJob.pauseDetails?.requiresFbrAction === false &&
+                    !automaticRetryPause &&
+                    activeJob.pauseAction !== "portal_autofill_off"
+                      ? "default"
+                      : "ghost"
+                  }
+                  disabled={actionLoading === activeJob.id}
+                  onClick={() => handleCancelJob(activeJob.id)}
                 >
-                  Reconnect to FBR
+                  {activeJob.pauseDetails?.requiresFbrAction === false &&
+                  !automaticRetryPause &&
+                  activeJob.pauseAction !== "portal_autofill_off"
+                    ? "Cancel this paused filing"
+                    : "Cancel this filing"}
                 </Button>
-              )}
+                {inspectionPause &&
+                  !completedEntry &&
+                  activeJob.pauseDetails?.requiresFbrAction !== false && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={sessionLoading}
+                      onClick={handleCreateSession}
+                    >
+                      Reconnect to FBR
+                    </Button>
+                  )}
+              </div>
             </CardContent>
           </Card>
         )}
@@ -1086,6 +1305,14 @@ function HandoffCompleteCard({
     scope?.route?.incomeSources.includes("services") === true ||
     scope?.business?.route === "services_tax_deduction" ||
     scope?.save?.routePolicy === "services_save_once";
+  const isBankProfitRoute =
+    scope?.route?.id === "bank_profit" ||
+    scope?.route?.incomeSources.includes("bank_profit") === true ||
+    Boolean(scope?.bankProfit);
+  const isDividendRoute =
+    scope?.route?.id === "dividend" ||
+    scope?.route?.incomeSources.includes("dividend") === true ||
+    Boolean(scope?.dividend);
   const hasFullBusiness = scope?.business?.route === "business";
   const hasSalary = Number(scope?.salaryFields?.total || 0) > 0;
   const hasPension = Number(scope?.pensionFields?.total || 0) > 0;
@@ -1095,9 +1322,14 @@ function HandoffCompleteCard({
     hasSalary ? "Salary" : null,
     hasFullBusiness ? "Business" : null,
     hasPension ? "Pension" : null,
+    isBankProfitRoute ? "Bank Profit" : null,
+    isDividendRoute ? "Dividend" : null,
     isServicesRoute ? "Freelancer / Services" : null,
   ].filter(Boolean).join(" + ") || "FBR return";
-  const requiresGeneralFinalReview = !isServicesRoute || hasFullBusiness;
+  const requiresGeneralFinalReview =
+    (!isServicesRoute || hasFullBusiness) &&
+    !isBankProfitRoute &&
+    !isDividendRoute;
   if (scope?.business) {
     const visibleBusinessPending = (scope.business.pendingItems ?? []).filter(
       (item) => {
@@ -1238,6 +1470,40 @@ function HandoffCompleteCard({
                 detail: `Not saved by the agent (${save.reason || "not attempted"}). Press Save in FBR to keep the figures.`,
                 state: "attention",
               },
+    );
+  }
+  if (isBankProfitRoute) {
+    rows.push(
+      scope?.bankProfit === "filled"
+        ? {
+            title: "Bank Profit on Debt (Other Sources)",
+            detail:
+              "Bank Profit gross income and tax deducted (u/s 151 / 236I) were entered and read back from FBR Other Sources.",
+            state: "done",
+          }
+        : {
+            title: "Bank Profit on Debt (Other Sources)",
+            detail:
+              "Some Bank Profit amounts need review in FBR Other Sources (Final / Fixed Tax).",
+            state: "attention",
+          },
+    );
+  }
+  if (isDividendRoute) {
+    rows.push(
+      scope?.dividend === "filled"
+        ? {
+            title: "Dividend Income (Other Sources)",
+            detail:
+              "Dividend gross income and tax deducted (u/s 150) were entered and read back from FBR Other Sources.",
+            state: "done",
+          }
+        : {
+            title: "Dividend Income (Other Sources)",
+            detail:
+              "Some Dividend amounts need review in FBR Other Sources (Final / Fixed Tax).",
+            state: "attention",
+          },
     );
   }
   if (requiresGeneralFinalReview && (!scope?.business || scope.salary !== "not_entered")) {
@@ -1406,7 +1672,7 @@ function HandoffCompleteCard({
             : savedByAgent
               ? "It pressed Save once in your FBR draft; Submit, Prepare PSID and payment were not pressed."
               : "The agent did not press Save in this run; Submit, Prepare PSID and payment were not pressed."}{" "}
-          {requiresGeneralFinalReview &&
+          {(requiresGeneralFinalReview || isBankProfitRoute || isDividendRoute) &&
             "Review and submit it yourself in the FBR window after the final review."}
         </p>
       </CardHeader>
@@ -1422,7 +1688,7 @@ function HandoffCompleteCard({
           </ul>
         </div>
 
-        {requiresGeneralFinalReview && (
+        {(requiresGeneralFinalReview || isBankProfitRoute || isDividendRoute) && (
         <div className="px-4">
           <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             Before you submit in FBR

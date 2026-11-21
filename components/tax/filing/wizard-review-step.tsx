@@ -382,9 +382,9 @@ export function WizardReviewStep({
                 return (
                   <li
                     key={`${line.source}-${line.ruleId}`}
-                    className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5"
+                    className="flex items-center justify-between gap-4 px-3 py-2.5"
                   >
-                    <div className="min-w-0">
+                    <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="text-sm font-medium">{title}</span>
                         {line.isFinalTax && (
@@ -415,7 +415,7 @@ export function WizardReviewStep({
                         )}
                       </p>
                     </div>
-                    <span className="text-sm font-semibold tabular-nums">
+                    <span className="shrink-0 whitespace-nowrap text-right text-sm font-semibold tabular-nums">
                       {amount(line.taxDue)}
                     </span>
                   </li>

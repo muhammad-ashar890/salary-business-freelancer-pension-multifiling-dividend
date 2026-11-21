@@ -20,7 +20,7 @@ export async function POST(req: NextRequest) {
       (body as any)?.deviceToken ||
       (body as any)?.deviceAuthToken ||
       bearerToken;
-    const { filingDraftId } = body as any;
+    const { filingDraftId, fbrConnected, fbrWindowOpen } = body as any;
 
     if (!deviceToken) {
       return NextResponse.json(
@@ -45,11 +45,118 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Update last seen
+    const shouldClearStaleFbr =
+      fbrConnected === false && Boolean(device.localFbrConnectedAt);
+    const shouldHealConnectedFbr =
+      fbrConnected === true && !device.localFbrConnectedAt;
+
+    // Update last seen (and clear stale localFbrConnectedAt whenever the
+    // running desktop agent reports that no FBR portal window is open/live,
+    // or restore it if the agent polls with an active live FBR portal session).
     await prisma.trustedDevice.update({
       where: { id: device.id },
-      data: { lastSeenAt: new Date() },
+      data: {
+        lastSeenAt: new Date(),
+        ...(shouldClearStaleFbr ? { localFbrConnectedAt: null } : {}),
+        ...(shouldHealConnectedFbr ? { localFbrConnectedAt: new Date() } : {}),
+      },
     });
+    if (shouldHealConnectedFbr) {
+      try {
+        await prisma.fbrConnection?.updateMany?.({
+          where: {
+            userId: device.userId,
+            status: { in: ["WAITING_FOR_AGENT", "NOT_STARTED"] },
+            ...(filingDraftId ? { filingDraftId } : {}),
+          },
+          data: {
+            status: "AGENT_CONNECTED",
+            message: "Trusted Desktop Agent connected",
+            lastHeartbeat: new Date(),
+          },
+        });
+      } catch {
+        // Optional connection sync.
+      }
+      try {
+        await prisma.taxAuditEvent?.create?.({
+          data: {
+            userId: device.userId,
+            filingDraftId: filingDraftId || null,
+            deviceId: device.id,
+            eventType: "DEVICE_READY",
+            eventDataJson: JSON.stringify({
+              partitionKey: device.partitionKey,
+              reason: "heartbeat_fbr_live",
+              fbrWindowOpen: true,
+            }),
+          },
+        });
+      } catch {
+        // Optional audit event.
+      }
+    }
+    if (fbrConnected === false) {
+      const windowOpen = fbrWindowOpen === true;
+      try {
+        await prisma.fbrConnection?.updateMany?.({
+          where: {
+            userId: device.userId,
+            status: { in: ["WAITING_FOR_AGENT", "AGENT_CONNECTED"] },
+            ...(filingDraftId ? { filingDraftId } : {}),
+          },
+          data: {
+            status: "WAITING_FOR_AGENT",
+            message: windowOpen
+              ? "FBR IRIS window is open. Sign in to FBR in that window to continue."
+              : "FBR window closed or disconnected. Reconnect securely to open FBR.",
+            lastHeartbeat: new Date(),
+          },
+        });
+      } catch {
+        // Optional connection cleanup.
+      }
+      if (typeof fbrWindowOpen === "boolean") {
+        try {
+          const desiredEvent = windowOpen
+            ? "DEVICE_FBR_WINDOW_OPEN"
+            : "DEVICE_FBR_DISCONNECTED";
+          const latestWindowEvent =
+            await prisma.taxAuditEvent?.findFirst?.({
+              where: {
+                deviceId: device.id,
+                eventType: {
+                  in: [
+                    "DEVICE_READY",
+                    "DEVICE_FBR_WINDOW_OPEN",
+                    "DEVICE_FBR_DISCONNECTED",
+                    "DEVICE_REGISTERED",
+                  ],
+                },
+              },
+              orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+              select: { eventType: true },
+            });
+          if (latestWindowEvent?.eventType !== desiredEvent) {
+            await prisma.taxAuditEvent?.create?.({
+              data: {
+                userId: device.userId,
+                filingDraftId: filingDraftId || null,
+                deviceId: device.id,
+                eventType: desiredEvent,
+                eventDataJson: JSON.stringify({
+                  partitionKey: device.partitionKey,
+                  reason: windowOpen ? "heartbeat_window_open" : "heartbeat_window_closed",
+                  fbrWindowOpen: windowOpen,
+                }),
+              },
+            });
+          }
+        } catch {
+          // Optional audit transition event.
+        }
+      }
+    }
 
     // Find next job
     // Priority: jobs assigned to this device in created/offered status, then unassigned jobs for user's waiting drafts

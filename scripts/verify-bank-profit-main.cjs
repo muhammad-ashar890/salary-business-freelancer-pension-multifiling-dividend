@@ -362,3 +362,74 @@ for(const config of [{saveThrows:true},{saveNotClicked:true},{dialogOpen:true},{
 
 test("Bank main with Previous Return checks exact opening net assets before and after Save without changing current gross",async()=>{const h=mainHarness({previousOpening:1500000}),out=await h.run();assert.equal(out.paused,false,out.pauseMessage);assert.equal(h.stats().saves,1);assert.equal(out.result.otherSourcesPreviousReturn.ok,true);assert.equal(out.result.otherSourcesPreviousReturnAfterSave.ok,true);assert.equal(out.result.bankProfit.completion.wealth.finalTaxIncome,1000000);});
 for(const config of [{previousActual:"1499999"},{previousActual:null},{previousAfterSave:"1499999"}])test(`Bank Previous Return proof blocks unsafe Save/completion ${JSON.stringify(config)}`,async()=>{const h=mainHarness({previousOpening:1500000,...config}),out=await h.run();assert.equal(out.paused,true);assert.equal(out.result.reviewRequired,true);assert.equal(h.stats().saves,config.previousAfterSave?1:0);});
+
+test("existing MIS 64040052 conflict emits structured pauseDetails, clean copy, and Bank Profit handoffScope (never Salary)",async()=>{
+ const h=mainHarness({
+  existingOtherSourcesRows:[
+   {section:"Final Tax",code:"64040052",description:"Profit on Debt u/s 151 (Bank)",cells:[{value:"2,465"},{value:"494"},{value:"493"}]},
+  ],
+ });
+ const out=await h.run();
+ assert.equal(out.paused,true);
+ assert.equal(out.pauseAction,"portal_state_confirmation");
+ assert.equal(h.stats().saves,0);
+ assert.doesNotMatch(out.pauseMessage,/combined entry is not enabled/);
+ assert.match(out.pauseMessage,/Comparison \(FBR IRIS vs\. TaxRocket Packet\):/);
+ assert.equal(out.result.pauseDetails.requiresFbrAction,false);
+ assert.equal(out.result.pauseDetails.rows.some(r=>r.code==="64040052"&&/2,465/.test(r.irisValue)&&/494/.test(r.irisValue)),true);
+
+ // Verify mergeNavigationAutofillOutcome + buildHandoffScopeSummary directly from main.js AST
+ vm.runInContext(functionSource("buildHandoffScopeSummary"),h.ctx);
+ vm.runInContext(functionSource("mergeNavigationAutofillOutcome"),h.ctx);
+ const merged=h.ctx.mergeNavigationAutofillOutcome({paused:false,pauseAction:"portal_sections_inspected",result:{routeScope:{id:"bank_profit",label:"Bank Profit",incomeSources:["bank_profit"]}},executionLog:[]},out,"live");
+ assert.equal(merged.paused,true);
+ assert.equal(merged.result.pauseDetails.title,"Existing FBR IRIS Bank Profit figures differ from your packet");
+ assert.match(merged.result.handoffScope.label,/Bank Profit/);
+ assert.doesNotMatch(merged.result.handoffScope.label,/Salary/);
+ assert.equal(merged.result.handoffScope.salary,"not_applicable");
+ assert.equal(merged.result.handoffScope.bankProfit,"needs_review");
+});
+
+test("completed Bank Profit run sets handoffScope.label to Bank Profit filled and bankProfit=filled",async()=>{
+ const h=mainHarness();
+ const out=await h.run();
+ vm.runInContext(functionSource("buildHandoffScopeSummary"),h.ctx);
+ vm.runInContext(functionSource("mergeNavigationAutofillOutcome"),h.ctx);
+ const merged=h.ctx.mergeNavigationAutofillOutcome({paused:false,pauseAction:"portal_sections_inspected",result:{routeScope:{id:"bank_profit",label:"Bank Profit",incomeSources:["bank_profit"]}},executionLog:[]},out,"live");
+ assert.equal(merged.paused,false);
+ assert.match(merged.result.handoffScope.label,/Bank Profit ✅ filled/);
+ assert.equal(merged.result.handoffScope.salary,"not_applicable");
+ assert.equal(merged.result.handoffScope.bankProfit,"filled");
+});
+
+test("when fillBankProfitEntries stops, main surfaces exact Bank Profit pauseDetails instead of bogus 7033/703000 wealth error and skips Wealth",async()=>{
+ let wealthCalled=false;
+ const h=mainHarness({bankOk:false});
+ h.ctx.irisWealthDriver={runWealthDriverStepwise:async()=>{wealthCalled=true;return{results:[],setup:[],stopped:false};}};
+ const out=await h.run();
+ assert.equal(out.paused,true);
+ assert.equal(wealthCalled,false);
+ assert.equal(h.stats().saves,0);
+ assert.doesNotMatch(out.pauseMessage,/Wealth totals or reconciliation did not match/);
+ assert.ok(out.result.pauseDetails);
+ assert.equal(out.result.pauseDetails.title,"Bank Profit entry paused before saving");
+ assert.equal(out.result.pauseDetails.rows.length,1);
+ assert.equal(out.result.pauseDetails.rows[0].code,"64040052");
+ assert.doesNotMatch(out.result.pauseDetails.title,/Wealth totals/);
+});
+
+test("when existing income check pauses on a second code, non-conflict codes show actual IRIS figures instead of falsely saying Empty (PKR 0)",async()=>{
+ const h=mainHarness({
+  existingOtherSourcesRows:[
+   {section:"Final Tax",code:"64040052",description:"Profit on Debt u/s 151(1)(b) from Bank Accounts / Deposits",cells:[{value:"1,000,000"},{value:"150,000"},{value:"150,000"}]},
+   {section:"Final Tax",code:"64040054",description:"151(1) (d) - Profit on Debt u/s 151 from Others",cells:[{value:"50,000"},{value:"10,000"},{value:"10,000"}]},
+  ],
+ });
+ const out=await h.run();
+ assert.equal(out.paused,true);
+ assert.equal(out.pauseAction,"portal_state_confirmation");
+ const row64040052=out.result.pauseDetails.rows.find(r=>r.code==="64040052");
+ assert.ok(row64040052);
+ assert.match(row64040052.irisValue,/1,000,000/);
+ assert.doesNotMatch(row64040052.irisValue,/Empty/);
+});
